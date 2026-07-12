@@ -1,0 +1,40 @@
+joint_limits:
+  # --- TAY MÁY TRÁI ---
+  left_shoulder_pan_joint:
+    has_acceleration_limits: true
+    max_acceleration: 5.0
+  left_shoulder_lift_joint:
+    has_acceleration_limits: true
+    max_acceleration: 5.0
+  left_elbow_joint:
+    has_acceleration_limits: true
+    max_acceleration: 5.0
+  left_wrist_1_joint:
+    has_acceleration_limits: true
+    max_acceleration: 5.0
+  left_wrist_2_joint:
+    has_acceleration_limits: true
+    max_acceleration: 5.0
+  left_wrist_3_joint:
+    has_acceleration_limits: true
+    max_acceleration: 5.0
+
+  # --- TAY MÁY PHẢI ---
+  right_shoulder_pan_joint:
+    has_acceleration_limits: true
+    max_acceleration: 5.0
+  right_shoulder_lift_joint:
+    has_acceleration_limits: true
+    max_acceleration: 5.0
+  right_elbow_joint:
+    has_acceleration_limits: true
+    max_acceleration: 5.0
+  right_wrist_1_joint:
+    has_acceleration_limits: true
+    max_acceleration: 5.0
+  right_wrist_2_joint:
+    has_acceleration_limits: true
+    max_acceleration: 5.0
+  right_wrist_3_joint:
+    has_acceleration_limits: true
+    max_acceleration: 5.0

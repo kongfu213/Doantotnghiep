@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<robot name="dual_ur_onrobot" xmlns:xacro="http://ros.org/wiki/xacro">
+
+    <xacro:include filename="$(find ur_onrobot_moveit_config)/config/ur_onrobot.srdf.xacro" />
+
+    <xacro:ur_onrobot_srdf name="ur_onrobot" prefix="left_" />
+
+    <xacro:ur_onrobot_srdf name="ur_onrobot" prefix="right_" />
+
+    <group_state name="left_home" group="left_ur_onrobot_manipulator">
+        <joint name="left_elbow_joint" value="0" />
+        <joint name="left_shoulder_lift_joint" value="-1.5707" />
+        <joint name="left_shoulder_pan_joint" value="0" />
+        <joint name="left_wrist_1_joint" value="0" />
+        <joint name="left_wrist_2_joint" value="0" />
+        <joint name="left_wrist_3_joint" value="0" />
+    </group_state>
+
+    <group_state name="left_up" group="left_ur_onrobot_manipulator">
+        <joint name="left_elbow_joint" value="0" />
+        <joint name="left_shoulder_lift_joint" value="-1.5707" />
+        <joint name="left_shoulder_pan_joint" value="0" />
+        <joint name="left_wrist_1_joint" value="-1.5707" />
+        <joint name="left_wrist_2_joint" value="0" />
+        <joint name="left_wrist_3_joint" value="0" />
+    </group_state>
+
+    <group_state name="right_home" group="right_ur_onrobot_manipulator">
+        <joint name="right_elbow_joint" value="0" />
+        <joint name="right_shoulder_lift_joint" value="-1.5707" />
+        <joint name="right_shoulder_pan_joint" value="0" />
+        <joint name="right_wrist_1_joint" value="0" />
+        <joint name="right_wrist_2_joint" value="0" />
+        <joint name="right_wrist_3_joint" value="0" />
+    </group_state>
+
+    <group_state name="right_up" group="right_ur_onrobot_manipulator">
+        <joint name="right_elbow_joint" value="0" />
+        <joint name="right_shoulder_lift_joint" value="-1.5707" />
+        <joint name="right_shoulder_pan_joint" value="0" />
+        <joint name="right_wrist_1_joint" value="-1.5707" />
+        <joint name="right_wrist_2_joint" value="0" />
+        <joint name="right_wrist_3_joint" value="0" />
+    </group_state>
+
+    <disable_collisions link1="left_base_link" link2="right_base_link" reason="FixedBase" />
+    <disable_collisions link1="left_base_link_inertia" link2="right_base_link_inertia" reason="FixedBase" />
+    <disable_collisions link1="left_base_link" link2="right_base_link_inertia" reason="FixedBase" />
+    <disable_collisions link1="left_base_link_inertia" link2="right_base_link" reason="FixedBase" />
+
+</robot>
