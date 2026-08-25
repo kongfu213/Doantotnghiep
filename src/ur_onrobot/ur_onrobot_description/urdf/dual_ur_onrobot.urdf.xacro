@@ -26,7 +26,7 @@
         ur_type="$(arg ur_type)"
         onrobot_type="$(arg onrobot_type)"
         tf_prefix="left_"
-        use_fake_hardware="$(arg use_fake_hardware)"
+        use_fake_hardware="$(arg use_fake_hardware)" 
         joint_limits_parameters_file="$(arg joint_limits_parameters_file)"
         kinematics_parameters_file="$(arg kinematics_parameters_file)"
         physical_parameters_file="$(arg physical_parameters_file)"
@@ -44,7 +44,7 @@
         ur_type="$(arg ur_type)"
         onrobot_type="$(arg onrobot_type)"
         tf_prefix="right_"
-        use_fake_hardware="$(arg use_fake_hardware)"
+        use_fake_hardware="$(arg use_fake_hardware)" 
         joint_limits_parameters_file="$(arg joint_limits_parameters_file)"
         kinematics_parameters_file="$(arg kinematics_parameters_file)"
         physical_parameters_file="$(arg physical_parameters_file)"
@@ -55,5 +55,4 @@
     >
         <origin xyz="0.0 -0.5 0.0" rpy="0.0 0.0 0.0" />
     </xacro:ur_onrobot>
-
 </robot>

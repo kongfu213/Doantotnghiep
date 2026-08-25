@@ -20,11 +20,12 @@
         script_filename
         output_recipe_filename
         input_recipe_filename
+        include_ros2_control:=false
         ">
 
         <xacro:ur_robot
             robot_ip="${robot_ip}"
-            name="${ur_type}"
+            name="${tf_prefix}${ur_type}" 
             parent="${parent}"
             tf_prefix="${tf_prefix}"
             use_fake_hardware="${use_fake_hardware}"

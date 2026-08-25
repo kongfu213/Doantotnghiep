@@ -18,13 +18,27 @@ def launch_setup(context, *args, **kwargs):
     left_robot_ip = LaunchConfiguration("left_robot_ip")
     right_robot_ip = LaunchConfiguration("right_robot_ip")
 
-    # Biên dịch file Xacro gộp với đầy đủ argument truyền vào
+    # --- BỔ SUNG CÁC THAM SỐ FILE MẶC ĐỊNH CHO ROBOT UR ---
+    ur_description_package = FindPackageShare("ur_description")
+    
+    joint_limits_parameters_file = PathJoinSubstitution([ur_description_package, "config", ur_type, "joint_limits.yaml"])
+    kinematics_parameters_file = PathJoinSubstitution([ur_description_package, "config", ur_type, "default_kinematics.yaml"])
+    physical_parameters_file = PathJoinSubstitution([ur_description_package, "config", ur_type, "physical_parameters.yaml"])
+    visual_parameters_file = PathJoinSubstitution([ur_description_package, "config", ur_type, "visual_parameters.yaml"])
+
+    # Biên dịch file Xacro gộp với ĐẦY ĐỦ tham số để tránh lỗi gãy cấu trúc phần cứng
     robot_description_content = Command([
         PathJoinSubstitution([FindExecutable(name="xacro")]), " ",
         PathJoinSubstitution([FindPackageShare('ur_onrobot_description'), "urdf", 'dual_ur_onrobot.urdf.xacro']), " ",
         "ur_type:=", ur_type, " ",
         "onrobot_type:=", onrobot_type, " ",
-        "use_fake_hardware:=", use_fake_hardware,
+        "use_fake_hardware:=", use_fake_hardware, " ",
+        "joint_limits_parameters_file:=", joint_limits_parameters_file, " ",
+        "kinematics_parameters_file:=", kinematics_parameters_file, " ",
+        "physical_parameters_file:=", physical_parameters_file, " ",
+        "visual_parameters_file:=", visual_parameters_file, " ",
+        "left_robot_ip:=", left_robot_ip, " ",
+        "right_robot_ip:=", right_robot_ip, " ",
     ])
     robot_description = {"robot_description": ParameterValue(value=robot_description_content, value_type=str)}
 
@@ -33,11 +47,14 @@ def launch_setup(context, *args, **kwargs):
         FindPackageShare('ur_onrobot_control'), "config", 'dual_ur_onrobot_controllers.yaml'
     ])
 
-    # Node quản lý trung tâm (Chỉ chạy khi dùng Fake/Sim hardware)
+    # Node quản lý trung tâm (Sửa lại nạp tham số phẳng để tránh lỗi sập exit code -6)
     control_node = Node(
         package="controller_manager",
         executable="ros2_control_node",
-        parameters=[robot_description, ParameterFile(initial_joint_controllers, allow_substs=True)],
+        parameters=[
+            robot_description, 
+            ParameterFile(initial_joint_controllers, allow_substs=True)
+        ],
         output="screen",
         condition=IfCondition(use_fake_hardware),
     )
@@ -50,7 +67,7 @@ def launch_setup(context, *args, **kwargs):
         parameters=[robot_description],
     )
 
-    # --- HÀM TẠO SPAWNER CONTROLLER THÔNG MINH ---
+    # --- HÀM TẠO SPAWNER CONTROLLER ---
     def make_spawner(controller_name, activate=True):
         arguments = [controller_name, "-c", "/controller_manager"]
         if not activate:
@@ -91,8 +108,8 @@ def launch_setup(context, *args, **kwargs):
     for c in inactive_list:
         spawner_nodes.append(make_spawner(c, activate=False))
 
-    # Áp dụng kĩ thuật hoãn binh 3 giây để tránh lỗi crash dịch vụ
-    delayed_spawners = TimerAction(period=3.0, actions=spawner_nodes)
+    # Áp dụng kĩ thuật hoãn binh 6.0 giây để hệ thống gộp ổn định luồng dịch vụ trước khi nạp controller
+    delayed_spawners = TimerAction(period=6.0, actions=spawner_nodes)
 
     # Node hiển thị RViz2
     rviz_config_file = PathJoinSubstitution([FindPackageShare('ur_onrobot_description'), "rviz", "view_robot.rviz"])
@@ -107,6 +124,6 @@ def generate_launch_description():
         DeclareLaunchArgument("left_robot_ip", default_value="192.168.56.101"),
         DeclareLaunchArgument("right_robot_ip", default_value="192.168.56.102"),
         DeclareLaunchArgument("use_fake_hardware", default_value="true"),
-        DeclareLaunchArgument("initial_joint_controller", default_value="scaled_joint_trajectory_controller"),
+        DeclareLaunchArgument("initial_joint_controller", default_value="joint_trajectory_controller"),
     ]
     return LaunchDescription(declared_arguments + [OpaqueFunction(function=launch_setup)])

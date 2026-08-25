@@ -3,8 +3,7 @@ project(ur_onrobot_control)
 
 find_package(ament_cmake REQUIRED)
 
-install(
-  DIRECTORY launch config
+install(DIRECTORY config launch 
   DESTINATION share/${PROJECT_NAME}
 )
 

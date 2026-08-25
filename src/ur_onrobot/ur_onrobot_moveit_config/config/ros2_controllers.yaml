@@ -1,0 +1,52 @@
+controller_manager:
+  ros__parameters:
+    update_rate: 500  # Hoặc thông số mặc định của bạn
+
+    joint_state_broadcaster:
+      type: joint_state_broadcaster/JointStateBroadcaster
+
+    # BẮT BUỘC PHẢI CÓ KHAI BÁO NÀY CHO TAY TRÁI
+    left_joint_trajectory_controller:
+      type: joint_trajectory_controller/JointTrajectoryController
+
+    # BẮT BUỘC PHẢI CÓ KHAI BÁO NÀY CHO TAY PHẢI
+    right_joint_trajectory_controller:
+      type: joint_trajectory_controller/JointTrajectoryController
+
+    # Tương tự cho 2 tay kẹp (nếu bạn có dùng)
+    left_finger_width_trajectory_controller:
+      type: joint_trajectory_controller/JointTrajectoryController
+    right_finger_width_trajectory_controller:
+      type: joint_trajectory_controller/JointTrajectoryController
+
+# CẤU HÌNH CHI TIẾT TAY TRÁI (Đừng để thiếu)
+left_joint_trajectory_controller:
+  ros__parameters:
+    joints:
+      - left_shoulder_pan_joint
+      - left_shoulder_lift_joint
+      - left_elbow_joint
+      - left_wrist_1_joint
+      - left_wrist_2_joint
+      - left_wrist_3_joint
+    command_interfaces:
+      - position
+    state_interfaces:
+      - position
+      - velocity
+
+# CẤU HÌNH CHI TIẾT TAY PHẢI
+right_joint_trajectory_controller:
+  ros__parameters:
+    joints:
+      - right_shoulder_pan_joint
+      - right_shoulder_lift_joint
+      - right_elbow_joint
+      - right_wrist_1_joint
+      - right_wrist_2_joint
+      - right_wrist_3_joint
+    command_interfaces:
+      - position
+    state_interfaces:
+      - position
+      - velocity

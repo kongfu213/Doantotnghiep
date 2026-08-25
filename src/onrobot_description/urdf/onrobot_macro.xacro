@@ -31,7 +31,7 @@
         </xacro:if>
 
         <!-- Define the OnRobot gripper hardware interface for ROS 2 control -->
-        <ros2_control name="OnRobotGripper" type="actuator">
+        <ros2_control name="${prefix}OnRobotGripper" type="actuator">
             <hardware>
                 <xacro:if value="${sim_gazebo}">
                     <plugin>gazebo_ros2_control/GazeboSystem</plugin>
