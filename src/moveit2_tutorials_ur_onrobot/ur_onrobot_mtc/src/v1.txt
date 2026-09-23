@@ -1,0 +1,2926 @@
+#include <memory>
+#include <thread>
+#include <chrono>
+#include <cmath>
+#include <string>
+#include <vector>
+#include <map>
+#include <limits>
+#include <algorithm>
+
+#include <rclcpp/rclcpp.hpp>
+
+#include <moveit/move_group_interface/move_group_interface.h>
+#include <moveit/planning_scene_interface/planning_scene_interface.h>
+#include <moveit/planning_scene/planning_scene.h>
+#include <moveit/robot_state/robot_state.h>
+
+#include <moveit/task_constructor/task.h>
+#include <moveit/task_constructor/solvers.h>
+#include <moveit/task_constructor/stages.h>
+
+#include <moveit_msgs/msg/collision_object.hpp>
+#include <moveit_msgs/msg/move_it_error_codes.hpp>
+#include <moveit_msgs/msg/constraints.hpp>
+#include <moveit_msgs/msg/joint_constraint.hpp>
+
+#include <Eigen/Geometry>
+
+namespace mtc = moveit::task_constructor;
+static const rclcpp::Logger LOGGER = rclcpp::get_logger("dual_arm_mtc_node");
+
+struct ArmConfig
+{
+  std::string arm_group;
+  std::string hand_group;
+  std::string hand_frame;
+  std::string object_name;
+};
+
+struct Candidate
+{
+  moveit::core::RobotState pregrasp;
+  moveit::core::RobotState grasp;
+  double angle = 0.0;
+  double rank_score = std::numeric_limits<double>::infinity();
+
+  explicit Candidate(const moveit::core::RobotModelConstPtr& model)
+    : pregrasp(model), grasp(model) {}
+};
+
+struct DualTaskTargets
+{
+  std::map<std::string, double> pregrasp;
+  std::map<std::string, double> grasp;
+  std::map<std::string, double> lift;
+  std::map<std::string, double> preplace;
+  std::map<std::string, double> place;
+  std::map<std::string, double> home;
+  double left_angle = 0.0;
+  double right_angle = 0.0;
+  double score = 0.0;
+};
+
+static Eigen::Isometry3d poseToEigen(const geometry_msgs::msg::Pose& p)
+{
+  Eigen::Quaterniond q(p.orientation.w, p.orientation.x, p.orientation.y, p.orientation.z);
+  Eigen::Isometry3d t = Eigen::Isometry3d::Identity();
+  t.linear() = q.normalized().toRotationMatrix();
+  t.translation() = Eigen::Vector3d(p.position.x, p.position.y, p.position.z);
+  return t;
+}
+
+static Eigen::Isometry3d graspFrameTransform()
+{
+  Eigen::Isometry3d tf = Eigen::Isometry3d::Identity();
+  Eigen::Quaterniond q =
+      Eigen::AngleAxisd(M_PI / 2.0, Eigen::Vector3d::UnitX()) *
+      Eigen::AngleAxisd(M_PI / 2.0, Eigen::Vector3d::UnitY()) *
+      Eigen::AngleAxisd(M_PI / 2.0, Eigen::Vector3d::UnitZ());
+  tf.linear() = q.matrix();
+  tf.translation().z() = 0.015;
+  return tf;
+}
+
+static bool solveIKCollisionFree(
+    const planning_scene::PlanningScenePtr& scene,
+    const ArmConfig& cfg,
+    const Eigen::Isometry3d& target,
+    const moveit::core::RobotState& seed,
+    moveit::core::RobotState& solution,
+    int attempts = 12)
+{
+  const auto* jmg = scene->getRobotModel()->getJointModelGroup(cfg.arm_group);
+  if (!jmg)
+    return false;
+
+  for (int i = 0; i < attempts; ++i) {
+    moveit::core::RobotState trial(seed);
+
+    if (i > 0) {
+      trial.setToRandomPositions(jmg);
+      trial.update();
+    }
+
+    if (!trial.setFromIK(jmg, target, cfg.hand_frame, 0.15))
+      continue;
+
+    trial.update();
+
+    if (!trial.satisfiesBounds(jmg))
+      continue;
+
+    if (scene->isStateColliding(trial, cfg.arm_group, false))
+      continue;
+
+    solution = trial;
+    return true;
+  }
+
+  return false;
+}
+
+static bool validateApproach(
+    const planning_scene::PlanningScenePtr& scene,
+    const ArmConfig& cfg,
+    const Eigen::Isometry3d& world_hand_grasp,
+    const moveit::core::RobotState& pregrasp_state)
+{
+  const auto* jmg = scene->getRobotModel()->getJointModelGroup(cfg.arm_group);
+  if (!jmg)
+    return false;
+
+  constexpr double APPROACH_DISTANCE = 0.05;
+  constexpr int STEPS = 10;
+
+  moveit::core::RobotState state(pregrasp_state);
+
+  for (int i = 1; i <= STEPS; ++i) {
+    const double d = APPROACH_DISTANCE * static_cast<double>(i) / static_cast<double>(STEPS);
+    Eigen::Isometry3d pose =
+        world_hand_grasp * Eigen::Translation3d(0.0, 0.0, d - APPROACH_DISTANCE);
+
+    if (!state.setFromIK(jmg, pose, cfg.hand_frame, 0.10))
+      return false;
+
+    state.update();
+
+    if (scene->isStateColliding(state, cfg.arm_group, false))
+      return false;
+  }
+
+  return true;
+}
+
+static std::vector<Candidate> findCandidates(
+    const planning_scene::PlanningScenePtr& scene,
+    const ArmConfig& cfg,
+    const Eigen::Isometry3d& world_object,
+    const moveit::core::RobotState& seed)
+{
+  std::vector<Candidate> out;
+  const Eigen::Isometry3d hand_to_grasp = graspFrameTransform();
+
+  constexpr double APPROACH_DISTANCE = 0.05;
+
+  // Quet day du 0..350 deg, khong uu tien cung 260 deg nua.
+  for (int idx = 0; idx < 36; ++idx) {
+    const double angle = idx * M_PI / 18.0;
+
+    Eigen::Isometry3d object_grasp =
+        Eigen::Isometry3d(Eigen::AngleAxisd(angle, Eigen::Vector3d::UnitZ()));
+
+    const Eigen::Isometry3d world_grasp = world_object * object_grasp;
+    const Eigen::Isometry3d world_hand_grasp = world_grasp * hand_to_grasp.inverse();
+    const Eigen::Isometry3d world_hand_pregrasp =
+        world_hand_grasp * Eigen::Translation3d(0.0, 0.0, -APPROACH_DISTANCE);
+
+    moveit::core::RobotState grasp(scene->getRobotModel());
+    if (!solveIKCollisionFree(scene, cfg, world_hand_grasp, seed, grasp))
+      continue;
+
+    moveit::core::RobotState pregrasp(scene->getRobotModel());
+    if (!solveIKCollisionFree(scene, cfg, world_hand_pregrasp, grasp, pregrasp))
+      continue;
+
+    if (!validateApproach(scene, cfg, world_hand_grasp, pregrasp))
+      continue;
+
+    Candidate c(scene->getRobotModel());
+    c.pregrasp = pregrasp;
+    c.grasp = grasp;
+    c.angle = angle;
+    out.push_back(c);
+  }
+
+  return out;
+}
+
+static double nearestEquivalentAngle(
+    double target,
+    double current,
+    const moveit::core::VariableBounds& bounds)
+{
+  double best = target;
+  double best_delta = std::abs(target - current);
+
+  for (int k = -2; k <= 2; ++k) {
+    const double candidate = target + static_cast<double>(k) * 2.0 * M_PI;
+
+    if (bounds.position_bounded_ &&
+        (candidate < bounds.min_position_ || candidate > bounds.max_position_))
+      continue;
+
+    const double delta = std::abs(candidate - current);
+
+    if (delta < best_delta) {
+      best = candidate;
+      best_delta = delta;
+    }
+  }
+
+  return best;
+}
+
+static void normalizeGroupNearState(
+    const moveit::core::RobotModelConstPtr& robot_model,
+    const moveit::core::JointModelGroup* jmg,
+    const moveit::core::RobotState& reference,
+    std::vector<double>& q)
+{
+  const auto& names = jmg->getVariableNames();
+  std::vector<double> ref_q;
+  reference.copyJointGroupPositions(jmg, ref_q);
+
+  for (std::size_t i = 0; i < q.size() && i < names.size(); ++i) {
+    const auto& bounds = robot_model->getVariableBounds(names[i]);
+    q[i] = nearestEquivalentAngle(q[i], ref_q[i], bounds);
+  }
+}
+
+static double jointTravelScore(
+    const std::vector<double>& left_q,
+    const std::vector<double>& right_q,
+    const std::vector<double>& left_current,
+    const std::vector<double>& right_current,
+    double& max_delta)
+{
+  double sum = 0.0;
+  max_delta = 0.0;
+
+  for (std::size_t i = 0; i < left_q.size(); ++i) {
+    const double d = std::abs(left_q[i] - left_current[i]);
+    sum += d;
+    max_delta = std::max(max_delta, d);
+  }
+
+  for (std::size_t i = 0; i < right_q.size(); ++i) {
+    const double d = std::abs(right_q[i] - right_current[i]);
+    sum += d;
+    max_delta = std::max(max_delta, d);
+  }
+
+  return sum + 2.0 * max_delta;
+}
+
+static bool validateDualInterpolation(
+    const planning_scene::PlanningScenePtr& scene,
+    const moveit::core::RobotState& start,
+    const moveit::core::RobotState& goal,
+    const moveit::core::JointModelGroup* dual_jmg,
+    int steps = 30)
+{
+  std::vector<double> q0;
+  std::vector<double> q1;
+  start.copyJointGroupPositions(dual_jmg, q0);
+  goal.copyJointGroupPositions(dual_jmg, q1);
+
+  for (int i = 0; i <= steps; ++i) {
+    const double u = static_cast<double>(i) / static_cast<double>(steps);
+    std::vector<double> q(q0.size());
+
+    for (std::size_t j = 0; j < q.size(); ++j)
+      q[j] = q0[j] + u * (q1[j] - q0[j]);
+
+    moveit::core::RobotState state(start);
+    state.setJointGroupPositions(dual_jmg, q);
+    state.update();
+
+    if (!state.satisfiesBounds(dual_jmg))
+      return false;
+
+    if (scene->isStateColliding(state, "", false))
+      return false;
+  }
+
+  return true;
+}
+
+static std::map<std::string, double> groupGoal(
+    const moveit::core::RobotState& state,
+    const moveit::core::JointModelGroup* jmg)
+{
+  std::vector<double> q;
+  state.copyJointGroupPositions(jmg, q);
+
+  std::map<std::string, double> goal;
+  const auto& names = jmg->getVariableNames();
+
+  for (std::size_t i = 0; i < names.size(); ++i)
+    goal[names[i]] = q[i];
+
+  return goal;
+}
+
+class DualArmMTCNode
+{
+public:
+  explicit DualArmMTCNode(const rclcpp::NodeOptions& options)
+  {
+    node_ = std::make_shared<rclcpp::Node>("dual_arm_mtc_node", options);
+
+    if (!node_->has_parameter("execute"))
+      node_->declare_parameter<bool>("execute", false);
+
+    if (!node_->has_parameter("left_place_x"))
+      node_->declare_parameter<double>("left_place_x", -0.25);
+    if (!node_->has_parameter("left_place_y"))
+      node_->declare_parameter<double>("left_place_y", 0.10);
+    if (!node_->has_parameter("left_place_z"))
+      node_->declare_parameter<double>("left_place_z", 0.052);
+
+    if (!node_->has_parameter("right_place_x"))
+      node_->declare_parameter<double>("right_place_x", -0.25);
+    if (!node_->has_parameter("right_place_y"))
+      node_->declare_parameter<double>("right_place_y", -0.10);
+    if (!node_->has_parameter("right_place_z"))
+      node_->declare_parameter<double>("right_place_z", 0.052);
+
+    if (!node_->has_parameter("left_place_roll_deg"))
+      node_->declare_parameter<double>("left_place_roll_deg", 0.0);
+    if (!node_->has_parameter("left_place_pitch_deg"))
+      node_->declare_parameter<double>("left_place_pitch_deg", 0.0);
+    if (!node_->has_parameter("left_place_yaw_deg"))
+      node_->declare_parameter<double>("left_place_yaw_deg", 0.0);
+
+    if (!node_->has_parameter("right_place_roll_deg"))
+      node_->declare_parameter<double>("right_place_roll_deg", 0.0);
+    if (!node_->has_parameter("right_place_pitch_deg"))
+      node_->declare_parameter<double>("right_place_pitch_deg", 0.0);
+    if (!node_->has_parameter("right_place_yaw_deg"))
+      node_->declare_parameter<double>("right_place_yaw_deg", 0.0);
+
+    if (!node_->has_parameter("task_mode"))
+      node_->declare_parameter<std::string>("task_mode", "pick_place");
+    if (!node_->has_parameter("demo_parallel_dz"))
+      node_->declare_parameter<double>("demo_parallel_dz", 0.05);
+    if (!node_->has_parameter("demo_single_dx"))
+      node_->declare_parameter<double>("demo_single_dx", 0.05);
+    if (!node_->has_parameter("demo_joint_delta"))
+      node_->declare_parameter<double>("demo_joint_delta", 0.08);
+
+    if (!node_->has_parameter("coord_center_shift"))
+      node_->declare_parameter<double>("coord_center_shift", 0.05);
+    if (!node_->has_parameter("coord_both_dz"))
+      node_->declare_parameter<double>("coord_both_dz", 0.03);
+    if (!node_->has_parameter("coord_rotate_deg"))
+      node_->declare_parameter<double>("coord_rotate_deg", 20.0);
+  }
+
+  rclcpp::node_interfaces::NodeBaseInterface::SharedPtr getNodeBaseInterface()
+  {
+    return node_->get_node_base_interface();
+  }
+
+  void run()
+  {
+    const std::string task_mode = node_->get_parameter("task_mode").as_string();
+
+    if (task_mode == "primitive_demo") {
+      runPrimitiveDemo();
+      return;
+    }
+
+    if (task_mode == "pose_demo") {
+      runPoseDemo();
+      return;
+    }
+
+    if (task_mode == "dual_pick_demo") {
+      runDualPickDemo();
+      return;
+    }
+
+    if (task_mode == "coordination_demo") {
+      runCoordinationDemo();
+      return;
+    }
+
+    if (task_mode != "pick_place") {
+      RCLCPP_ERROR(
+          LOGGER,
+          "task_mode='%s' khong hop le. Dung pick_place, primitive_demo, pose_demo, dual_pick_demo hoac coordination_demo.",
+          task_mode.c_str());
+      return;
+    }
+
+    try {
+      task_ = createTask();
+      task_.init();
+    }
+    catch (const mtc::InitStageException& e) {
+      RCLCPP_ERROR_STREAM(LOGGER, "MTC init failed:\n" << e);
+      return;
+    }
+    catch (const std::exception& e) {
+      RCLCPP_ERROR(LOGGER, "Create task failed: %s", e.what());
+      return;
+    }
+
+    if (!task_.plan(5)) {
+      RCLCPP_ERROR(LOGGER, "DUAL ARM MTC planning failed");
+      return;
+    }
+
+    RCLCPP_INFO(LOGGER, "==========================================");
+    RCLCPP_INFO(LOGGER, " DUAL ARM MTC FULL PICK+PLACE PLAN SUCCESS");
+    RCLCPP_INFO(LOGGER, " PREGRASP -> GRASP -> CLOSE -> ATTACH -> LIFT -> PLACE -> OPEN -> DETACH -> HOME");
+    RCLCPP_INFO(LOGGER, "==========================================");
+
+    task_.introspection().publishSolution(*task_.solutions().front());
+
+    const bool execute = node_->get_parameter("execute").as_bool();
+
+    if (!execute) {
+      RCLCPP_INFO(LOGGER, "Chi PLAN. Chay execute:=true de chay FULL PICK + PLACE.");
+      return;
+    }
+
+    const auto result = task_.execute(*task_.solutions().front());
+
+    if (result.val != moveit_msgs::msg::MoveItErrorCodes::SUCCESS) {
+      RCLCPP_ERROR(LOGGER, "DUAL ARM MTC FULL PICK+PLACE execution failed");
+      return;
+    }
+
+    RCLCPP_INFO(LOGGER, "DUAL ARM MTC FULL PICK+PLACE EXECUTION SUCCESS");
+  }
+
+  bool executeDualGrippers(double width, const std::string& phase_name)
+  {
+    moveit::planning_interface::MoveGroupInterface grippers(node_, "dual_grippers");
+    grippers.setStartStateToCurrentState();
+    grippers.setMaxVelocityScalingFactor(0.35);
+    grippers.setMaxAccelerationScalingFactor(0.30);
+
+    if (!grippers.setJointValueTarget(std::map<std::string, double>{
+            {"left_finger_width", width},
+            {"right_finger_width", width}})) {
+      RCLCPP_ERROR(LOGGER, "[%s] set gripper target failed", phase_name.c_str());
+      return false;
+    }
+
+    moveit::planning_interface::MoveGroupInterface::Plan plan;
+    if (grippers.plan(plan) != moveit::core::MoveItErrorCode::SUCCESS) {
+      RCLCPP_ERROR(LOGGER, "[%s] gripper PLAN FAILED", phase_name.c_str());
+      return false;
+    }
+
+    if (!node_->get_parameter("execute").as_bool()) {
+      RCLCPP_INFO(LOGGER, "[%s] gripper plan-only", phase_name.c_str());
+      return true;
+    }
+
+    if (grippers.execute(plan) != moveit::core::MoveItErrorCode::SUCCESS) {
+      RCLCPP_ERROR(LOGGER, "[%s] gripper EXECUTION FAILED", phase_name.c_str());
+      return false;
+    }
+
+    RCLCPP_INFO(LOGGER, "[%s] gripper EXECUTION SUCCESS", phase_name.c_str());
+    return true;
+  }
+
+  void runDualPickDemo()
+  {
+    moveit::planning_interface::MoveGroupInterface dual_group(node_, "dual_arms");
+    const auto model = dual_group.getRobotModel();
+    const auto* left_jmg = model->getJointModelGroup("left_ur_onrobot_manipulator");
+    const auto* right_jmg = model->getJointModelGroup("right_ur_onrobot_manipulator");
+    const auto* dual_jmg = model->getJointModelGroup("dual_arms");
+
+    if (!left_jmg || !right_jmg || !dual_jmg) {
+      RCLCPP_ERROR(LOGGER, "DIRECT PICK: thieu JointModelGroup");
+      return;
+    }
+
+    std::vector<std::string> left_hand_links;
+    std::vector<std::string> right_hand_links;
+    DualTaskTargets targets;
+
+    try {
+      RCLCPP_INFO(LOGGER, "DIRECT PICK: tim target PREGRASP/GRASP/LIFT...");
+      targets = preparePickTargetsFast(model, left_hand_links, right_hand_links);
+    }
+    catch (const std::exception& e) {
+      RCLCPP_ERROR(LOGGER, "DIRECT PICK target search failed: %s", e.what());
+      return;
+    }
+
+    auto home = dual_group.getCurrentState(5.0);
+    if (!home) {
+      RCLCPP_ERROR(LOGGER, "DIRECT PICK: khong doc duoc current state");
+      return;
+    }
+
+    auto applyGoal = [](moveit::core::RobotState& state,
+                        const std::map<std::string, double>& goal) {
+      for (const auto& kv : goal)
+        state.setVariablePosition(kv.first, kv.second);
+      state.update();
+    };
+
+    moveit::core::RobotState pre(*home);
+    moveit::core::RobotState grasp(*home);
+    moveit::core::RobotState lift(*home);
+    applyGoal(pre, targets.pregrasp);
+    applyGoal(grasp, targets.grasp);
+    applyGoal(lift, targets.lift);
+
+    // Use the same contact-near state that visually worked in pose_demo.
+    // 55% is close enough for the grippers to reach the object without relying
+    // on the old MTC arm execution path.
+    constexpr double CONTACT_FRACTION = 0.55;
+    std::vector<double> left_pre_q, right_pre_q, left_grasp_q, right_grasp_q;
+    pre.copyJointGroupPositions(left_jmg, left_pre_q);
+    pre.copyJointGroupPositions(right_jmg, right_pre_q);
+    grasp.copyJointGroupPositions(left_jmg, left_grasp_q);
+    grasp.copyJointGroupPositions(right_jmg, right_grasp_q);
+
+    std::vector<double> left_contact_q(left_pre_q.size());
+    std::vector<double> right_contact_q(right_pre_q.size());
+    for (std::size_t i = 0; i < left_pre_q.size(); ++i)
+      left_contact_q[i] = left_pre_q[i] + CONTACT_FRACTION * (left_grasp_q[i] - left_pre_q[i]);
+    for (std::size_t i = 0; i < right_pre_q.size(); ++i)
+      right_contact_q[i] = right_pre_q[i] + CONTACT_FRACTION * (right_grasp_q[i] - right_pre_q[i]);
+
+    moveit::core::RobotState contact(pre);
+    contact.setJointGroupPositions(left_jmg, left_contact_q);
+    contact.setJointGroupPositions(right_jmg, right_contact_q);
+    contact.update();
+
+    RCLCPP_INFO(LOGGER, "==========================================");
+    RCLCPP_INFO(LOGGER, " DIRECT DUAL PICK START");
+    RCLCPP_INFO(LOGGER, " P1 OPEN BOTH GRIPPERS");
+    RCLCPP_INFO(LOGGER, " P2 BOTH -> PREGRASP (12DOF)");
+    RCLCPP_INFO(LOGGER, " P3 BOTH -> CONTACT (12DOF)");
+    RCLCPP_INFO(LOGGER, " P4 CLOSE BOTH + ATTACH 2 OBJECTS");
+    RCLCPP_INFO(LOGGER, " P5 BOTH LIFT (12DOF)");
+    RCLCPP_INFO(LOGGER, " P6 PUT BACK + OPEN + DETACH");
+    RCLCPP_INFO(LOGGER, " P7 BOTH -> HOME");
+    RCLCPP_INFO(LOGGER, "==========================================");
+
+    if (!executeDualGrippers(0.100, "P1 OPEN BOTH"))
+      return;
+
+    if (!planExecuteDualState(dual_group, *home, pre, HoldMode::NONE,
+                              "P2 PARALLEL PREGRASP"))
+      return;
+
+    if (!node_->get_parameter("execute").as_bool()) {
+      RCLCPP_WARN(LOGGER, "execute:=false, stop after planning P2");
+      return;
+    }
+
+    rclcpp::sleep_for(std::chrono::milliseconds(700));
+
+    auto s2 = dual_group.getCurrentState(5.0);
+    if (!s2)
+      return;
+    if (!planExecuteDualState(dual_group, *s2, contact, HoldMode::NONE,
+                              "P3 PARALLEL CONTACT"))
+      return;
+
+    rclcpp::sleep_for(std::chrono::milliseconds(700));
+
+    if (!executeDualGrippers(0.0, "P4 CLOSE BOTH"))
+      return;
+
+    // Attach through MoveGroupInterface so the objects follow the grippers in
+    // the real PlanningScene during the lift.
+    const bool left_attached =
+        dual_group.attachObject("left_object", "left_gripper_tcp", left_hand_links);
+    const bool right_attached =
+        dual_group.attachObject("right_object", "right_gripper_tcp", right_hand_links);
+
+    if (!left_attached || !right_attached) {
+      RCLCPP_ERROR(LOGGER,
+                   "P4 ATTACH FAILED: left=%s right=%s",
+                   left_attached ? "OK" : "FAIL",
+                   right_attached ? "OK" : "FAIL");
+      return;
+    }
+
+    RCLCPP_INFO(LOGGER, "P4 ATTACH SUCCESS: both objects attached");
+    rclcpp::sleep_for(std::chrono::milliseconds(500));
+
+    auto s4 = dual_group.getCurrentState(5.0);
+    if (!s4)
+      return;
+    if (!planExecuteDualState(dual_group, *s4, lift, HoldMode::NONE,
+                              "P5 PARALLEL LIFT"))
+      return;
+
+    RCLCPP_INFO(LOGGER, "P5 HOLD LIFT 2 seconds for visual check");
+    rclcpp::sleep_for(std::chrono::seconds(2));
+
+    auto s5 = dual_group.getCurrentState(5.0);
+    if (!s5)
+      return;
+    if (!planExecuteDualState(dual_group, *s5, contact, HoldMode::NONE,
+                              "P6 PARALLEL PUT BACK"))
+      return;
+
+    rclcpp::sleep_for(std::chrono::milliseconds(500));
+
+    if (!executeDualGrippers(0.100, "P6 OPEN BOTH"))
+      return;
+
+    const bool left_detached = dual_group.detachObject("left_object");
+    const bool right_detached = dual_group.detachObject("right_object");
+    RCLCPP_INFO(LOGGER,
+                "P6 DETACH: left=%s right=%s",
+                left_detached ? "OK" : "FAIL",
+                right_detached ? "OK" : "FAIL");
+
+    auto s6 = dual_group.getCurrentState(5.0);
+    if (!s6)
+      return;
+    if (!planExecuteDualState(dual_group, *s6, pre, HoldMode::NONE,
+                              "P6 PARALLEL RETREAT"))
+      return;
+
+    auto s7 = dual_group.getCurrentState(5.0);
+    if (!s7)
+      return;
+    if (!planExecuteDualState(dual_group, *s7, *home, HoldMode::NONE,
+                              "P7 PARALLEL HOME"))
+      return;
+
+    RCLCPP_INFO(LOGGER, "==========================================");
+    RCLCPP_INFO(LOGGER, " DIRECT DUAL PICK SUCCESS");
+    RCLCPP_INFO(LOGGER, " 2 ROBOT CLOSE + ATTACH + LIFT SONG SONG PASS");
+    RCLCPP_INFO(LOGGER, "==========================================");
+  }
+
+  bool coordinatedJointNudge(
+      moveit::planning_interface::MoveGroupInterface& dual_group,
+      double requested_delta,
+      const std::string& phase_name)
+  {
+    const auto model = dual_group.getRobotModel();
+    const auto* left_jmg =
+        model->getJointModelGroup("left_ur_onrobot_manipulator");
+    const auto* right_jmg =
+        model->getJointModelGroup("right_ur_onrobot_manipulator");
+    const auto* dual_jmg =
+        model->getJointModelGroup("dual_arms");
+
+    if (!left_jmg || !right_jmg || !dual_jmg)
+      return false;
+
+    auto current = dual_group.getCurrentState(5.0);
+    if (!current)
+      return false;
+
+    std::vector<double> left_q;
+    std::vector<double> right_q;
+    current->copyJointGroupPositions(left_jmg, left_q);
+    current->copyJointGroupPositions(right_jmg, right_q);
+
+    const std::vector<double> scales = {1.0, 0.5, 0.25};
+    const std::vector<int> preferred_joints = {1, 2, 0, 3, 4, 5};
+
+    for (double scale : scales) {
+      const double d = requested_delta * scale;
+
+      for (int li : preferred_joints) {
+        for (int ri : preferred_joints) {
+          for (int sign_l : {1, -1}) {
+            for (int sign_r : {1, -1}) {
+              std::vector<double> lq = left_q;
+              std::vector<double> rq = right_q;
+
+              lq[static_cast<std::size_t>(li)] += sign_l * d;
+              rq[static_cast<std::size_t>(ri)] += sign_r * d;
+
+              moveit::core::RobotState target(*current);
+              target.setJointGroupPositions(left_jmg, lq);
+              target.setJointGroupPositions(right_jmg, rq);
+              target.update();
+
+              if (!target.satisfiesBounds(dual_jmg))
+                continue;
+
+              std::vector<double> dual_target;
+              target.copyJointGroupPositions(dual_jmg, dual_target);
+
+              dual_group.setPlannerId("RRTConnectkConfigDefault");
+              dual_group.setPlanningTime(4.0);
+              dual_group.setNumPlanningAttempts(2);
+              dual_group.setMaxVelocityScalingFactor(0.25);
+              dual_group.setMaxAccelerationScalingFactor(0.20);
+              dual_group.setStartState(*current);
+              dual_group.clearPathConstraints();
+              dual_group.setJointValueTarget(dual_target);
+
+              moveit::planning_interface::MoveGroupInterface::Plan plan;
+              const auto result = dual_group.plan(plan);
+
+              if (result != moveit::core::MoveItErrorCode::SUCCESS)
+                continue;
+
+              RCLCPP_INFO(
+                  LOGGER,
+                  "[%s] coordinated target FOUND: Ljoint=%d d=%+.3f, Rjoint=%d d=%+.3f, joints=%zu points=%zu",
+                  phase_name.c_str(),
+                  li, sign_l * d,
+                  ri, sign_r * d,
+                  plan.trajectory_.joint_trajectory.joint_names.size(),
+                  plan.trajectory_.joint_trajectory.points.size());
+
+              if (!node_->get_parameter("execute").as_bool())
+                return true;
+
+              if (dual_group.execute(plan) !=
+                  moveit::core::MoveItErrorCode::SUCCESS) {
+                RCLCPP_ERROR(
+                    LOGGER, "[%s] EXECUTION FAILED", phase_name.c_str());
+                return false;
+              }
+
+              RCLCPP_INFO(
+                  LOGGER, "[%s] EXECUTION SUCCESS", phase_name.c_str());
+              return true;
+            }
+          }
+        }
+      }
+    }
+
+    RCLCPP_ERROR(
+        LOGGER,
+        "[%s] khong tim duoc coordinated 12DOF nudge collision-free",
+        phase_name.c_str());
+    return false;
+  }
+
+  void runCoordinationDemo()
+  {
+    moveit::planning_interface::MoveGroupInterface dual_group(node_, "dual_arms");
+    const auto model = dual_group.getRobotModel();
+    const auto* left_jmg = model->getJointModelGroup("left_ur_onrobot_manipulator");
+    const auto* right_jmg = model->getJointModelGroup("right_ur_onrobot_manipulator");
+
+    if (!left_jmg || !right_jmg) {
+      RCLCPP_ERROR(LOGGER, "COORD: thieu arm JointModelGroup");
+      return;
+    }
+
+    std::vector<std::string> left_hand_links;
+    std::vector<std::string> right_hand_links;
+    DualTaskTargets targets;
+
+    try {
+      RCLCPP_INFO(LOGGER, "COORD: tim PREGRASP/GRASP/LIFT nhanh...");
+      targets = preparePickTargetsFast(model, left_hand_links, right_hand_links);
+    }
+    catch (const std::exception& e) {
+      RCLCPP_ERROR(LOGGER, "COORD target search failed: %s", e.what());
+      return;
+    }
+
+    auto home = dual_group.getCurrentState(5.0);
+    if (!home) {
+      RCLCPP_ERROR(LOGGER, "COORD: khong doc duoc current state");
+      return;
+    }
+
+    auto applyGoal = [](moveit::core::RobotState& state,
+                        const std::map<std::string, double>& goal) {
+      for (const auto& kv : goal)
+        state.setVariablePosition(kv.first, kv.second);
+      state.update();
+    };
+
+    moveit::core::RobotState pre(*home);
+    moveit::core::RobotState grasp(*home);
+    moveit::core::RobotState lift(*home);
+    applyGoal(pre, targets.pregrasp);
+    applyGoal(grasp, targets.grasp);
+    applyGoal(lift, targets.lift);
+
+    // Same safe contact point that worked in pose_demo: approach toward grasp,
+    // but do not force the arm through the object before attach.
+    constexpr double CONTACT_FRACTION = 0.55;
+    std::vector<double> left_pre_q, right_pre_q, left_grasp_q, right_grasp_q;
+    pre.copyJointGroupPositions(left_jmg, left_pre_q);
+    pre.copyJointGroupPositions(right_jmg, right_pre_q);
+    grasp.copyJointGroupPositions(left_jmg, left_grasp_q);
+    grasp.copyJointGroupPositions(right_jmg, right_grasp_q);
+
+    std::vector<double> left_contact_q(left_pre_q.size());
+    std::vector<double> right_contact_q(right_pre_q.size());
+    for (std::size_t i = 0; i < left_pre_q.size(); ++i)
+      left_contact_q[i] = left_pre_q[i] + CONTACT_FRACTION * (left_grasp_q[i] - left_pre_q[i]);
+    for (std::size_t i = 0; i < right_pre_q.size(); ++i)
+      right_contact_q[i] = right_pre_q[i] + CONTACT_FRACTION * (right_grasp_q[i] - right_pre_q[i]);
+
+    moveit::core::RobotState contact(pre);
+    contact.setJointGroupPositions(left_jmg, left_contact_q);
+    contact.setJointGroupPositions(right_jmg, right_contact_q);
+    contact.update();
+
+    const double center_shift = node_->get_parameter("coord_center_shift").as_double();
+    const double both_dz = node_->get_parameter("coord_both_dz").as_double();
+    const double rotate_rad = node_->get_parameter("coord_rotate_deg").as_double() * M_PI / 180.0;
+
+    auto pause = []() { rclcpp::sleep_for(std::chrono::milliseconds(700)); };
+
+    RCLCPP_INFO(LOGGER, "==========================================");
+    RCLCPP_INFO(LOGGER, " COORDINATION DEMO START");
+    RCLCPP_INFO(LOGGER, " P1 OPEN BOTH");
+    RCLCPP_INFO(LOGGER, " P2 BOTH -> PREGRASP");
+    RCLCPP_INFO(LOGGER, " P3 BOTH -> CONTACT");
+    RCLCPP_INFO(LOGGER, " P4 CLOSE + ATTACH");
+    RCLCPP_INFO(LOGGER, " P5 BOTH LIFT");
+    RCLCPP_INFO(LOGGER, " P6 LEFT HOLD, RIGHT MOVE TO CENTER");
+    RCLCPP_INFO(LOGGER, " P7 RIGHT HOLD, LEFT MOVE TO CENTER");
+    RCLCPP_INFO(LOGGER, " P8 BOTH MOVE TOGETHER (12DOF coordinated)");
+    RCLCPP_INFO(LOGGER, " P9 LEFT HOLD, RIGHT ROTATE OBJECT");
+    RCLCPP_INFO(LOGGER, " P10 RIGHT HOLD, LEFT ROTATE OBJECT");
+    RCLCPP_INFO(LOGGER, " P11 BOTH RETURN TO LIFT");
+    RCLCPP_INFO(LOGGER, " P12 PUT BACK + OPEN + DETACH + HOME");
+    RCLCPP_INFO(LOGGER, "==========================================");
+
+    if (!executeDualGrippers(0.100, "COORD P1 OPEN BOTH"))
+      return;
+
+    if (!planExecuteDualState(dual_group, *home, pre, HoldMode::NONE,
+                              "COORD P2 PARALLEL PREGRASP"))
+      return;
+
+    if (!node_->get_parameter("execute").as_bool()) {
+      RCLCPP_WARN(LOGGER, "COORD execute:=false, stop after P2 plan-only");
+      return;
+    }
+    pause();
+
+    auto s2 = dual_group.getCurrentState(5.0);
+    if (!s2)
+      return;
+    if (!planExecuteDualState(dual_group, *s2, contact, HoldMode::NONE,
+                              "COORD P3 PARALLEL CONTACT"))
+      return;
+    pause();
+
+    if (!executeDualGrippers(0.0, "COORD P4 CLOSE BOTH"))
+      return;
+
+    const bool left_attached =
+        dual_group.attachObject("left_object", "left_gripper_tcp", left_hand_links);
+    const bool right_attached =
+        dual_group.attachObject("right_object", "right_gripper_tcp", right_hand_links);
+
+    if (!left_attached || !right_attached) {
+      RCLCPP_ERROR(LOGGER, "COORD attach failed: LEFT=%s RIGHT=%s",
+                   left_attached ? "OK" : "FAIL",
+                   right_attached ? "OK" : "FAIL");
+      return;
+    }
+    RCLCPP_INFO(LOGGER, "COORD P4 ATTACH SUCCESS");
+    pause();
+
+    auto s4 = dual_group.getCurrentState(5.0);
+    if (!s4)
+      return;
+    if (!planExecuteDualState(dual_group, *s4, lift, HoldMode::NONE,
+                              "COORD P5 PARALLEL LIFT"))
+      return;
+    rclcpp::sleep_for(std::chrono::seconds(1));
+
+    // Save the real post-lift state. All later coordinated interaction returns here.
+    auto lift_reference_ptr = dual_group.getCurrentState(5.0);
+    if (!lift_reference_ptr)
+      return;
+    moveit::core::RobotState lift_reference(*lift_reference_ptr);
+
+    // P6: LEFT is hard-constrained. RIGHT carries object B toward shared workspace.
+    auto s6 = dual_group.getCurrentState(5.0);
+    if (!s6)
+      return;
+    Eigen::Isometry3d right_center = s6->getGlobalLinkTransform("right_gripper_tcp");
+    right_center.translation().y() += center_shift;
+    moveit::core::RobotState p6(*s6);
+    if (!buildDualPoseTargetIKOnly(*s6, nullptr, &right_center, p6)) {
+      RCLCPP_ERROR(LOGGER, "COORD P6: RIGHT center IK failed");
+      return;
+    }
+    if (!planExecuteDualState(dual_group, *s6, p6, HoldMode::HOLD_LEFT,
+                              "COORD P6 LEFT HOLD + RIGHT TO CENTER"))
+      return;
+    pause();
+
+    // P7: switch roles. RIGHT is constrained; LEFT carries object A toward center.
+    auto s7 = dual_group.getCurrentState(5.0);
+    if (!s7)
+      return;
+    Eigen::Isometry3d left_center = s7->getGlobalLinkTransform("left_gripper_tcp");
+    left_center.translation().y() -= center_shift;
+    moveit::core::RobotState p7(*s7);
+    if (!buildDualPoseTargetIKOnly(*s7, &left_center, nullptr, p7)) {
+      RCLCPP_ERROR(LOGGER, "COORD P7: LEFT center IK failed");
+      return;
+    }
+    if (!planExecuteDualState(dual_group, *s7, p7, HoldMode::HOLD_RIGHT,
+                              "COORD P7 RIGHT HOLD + LEFT TO CENTER"))
+      return;
+    pause();
+
+    // P8: both arms move together in one 12DOF trajectory.
+    // Avoid fragile Cartesian +Z dual IK after P6/P7; use a robust
+    // coordinated joint-space motion instead.
+    const double coord_joint_delta =
+        std::clamp(both_dz * 2.0, 0.03, 0.10);
+
+    if (!coordinatedJointNudge(
+            dual_group,
+            coord_joint_delta,
+            "COORD P8 BOTH MOVE TOGETHER 12DOF"))
+      return;
+    pause();
+
+    // P9: LEFT holds object A, RIGHT rotates object B around its local tool Z.
+    auto s9 = dual_group.getCurrentState(5.0);
+    if (!s9)
+      return;
+    Eigen::Isometry3d right_rotate = s9->getGlobalLinkTransform("right_gripper_tcp");
+    right_rotate.linear() =
+        right_rotate.linear() *
+        Eigen::AngleAxisd(rotate_rad, Eigen::Vector3d::UnitZ()).toRotationMatrix();
+    moveit::core::RobotState p9(*s9);
+    if (!buildDualPoseTargetIKOnly(*s9, nullptr, &right_rotate, p9)) {
+      RCLCPP_ERROR(LOGGER, "COORD P9: RIGHT rotate IK failed");
+      return;
+    }
+    if (!planExecuteDualState(dual_group, *s9, p9, HoldMode::HOLD_LEFT,
+                              "COORD P9 LEFT HOLD + RIGHT ROTATE"))
+      return;
+    pause();
+
+    // P10: switch roles again. RIGHT holds, LEFT rotates the other object.
+    auto s10 = dual_group.getCurrentState(5.0);
+    if (!s10)
+      return;
+    Eigen::Isometry3d left_rotate = s10->getGlobalLinkTransform("left_gripper_tcp");
+    left_rotate.linear() =
+        left_rotate.linear() *
+        Eigen::AngleAxisd(-rotate_rad, Eigen::Vector3d::UnitZ()).toRotationMatrix();
+    moveit::core::RobotState p10(*s10);
+    if (!buildDualPoseTargetIKOnly(*s10, &left_rotate, nullptr, p10)) {
+      RCLCPP_ERROR(LOGGER, "COORD P10: LEFT rotate IK failed");
+      return;
+    }
+    if (!planExecuteDualState(dual_group, *s10, p10, HoldMode::HOLD_RIGHT,
+                              "COORD P10 RIGHT HOLD + LEFT ROTATE"))
+      return;
+    rclcpp::sleep_for(std::chrono::seconds(1));
+
+    // P11: both arms return together to the post-lift state.
+    auto s11 = dual_group.getCurrentState(5.0);
+    if (!s11)
+      return;
+    if (!planExecuteDualState(dual_group, *s11, lift_reference, HoldMode::NONE,
+                              "COORD P11 PARALLEL RETURN TO LIFT"))
+      return;
+    pause();
+
+    // P12: lower to the same safe contact state, release both objects, retreat and home.
+    auto s12 = dual_group.getCurrentState(5.0);
+    if (!s12)
+      return;
+    if (!planExecuteDualState(dual_group, *s12, contact, HoldMode::NONE,
+                              "COORD P12 PARALLEL PUT BACK"))
+      return;
+    pause();
+
+    if (!executeDualGrippers(0.100, "COORD P12 OPEN BOTH"))
+      return;
+
+    const bool left_detached = dual_group.detachObject("left_object");
+    const bool right_detached = dual_group.detachObject("right_object");
+    RCLCPP_INFO(LOGGER, "COORD DETACH: LEFT=%s RIGHT=%s",
+                left_detached ? "OK" : "FAIL",
+                right_detached ? "OK" : "FAIL");
+
+    auto s13 = dual_group.getCurrentState(5.0);
+    if (!s13)
+      return;
+    if (!planExecuteDualState(dual_group, *s13, pre, HoldMode::NONE,
+                              "COORD P12 PARALLEL RETREAT"))
+      return;
+
+    auto s14 = dual_group.getCurrentState(5.0);
+    if (!s14)
+      return;
+    if (!planExecuteDualState(dual_group, *s14, *home, HoldMode::NONE,
+                              "COORD P12 PARALLEL HOME"))
+      return;
+
+    RCLCPP_INFO(LOGGER, "==========================================");
+    RCLCPP_INFO(LOGGER, " COORDINATION DEMO SUCCESS");
+    RCLCPP_INFO(LOGGER, " PARALLEL -> HOLD/ROLE SWITCH -> COORDINATED -> ROTATE -> ROLE SWITCH PASS");
+    RCLCPP_INFO(LOGGER, "==========================================");
+  }
+
+private:
+  enum class HoldMode
+  {
+    NONE,
+    HOLD_LEFT,
+    HOLD_RIGHT
+  };
+
+
+  bool buildDualPoseTargetIKOnly(
+      const moveit::core::RobotState& current,
+      const Eigen::Isometry3d* left_pose,
+      const Eigen::Isometry3d* right_pose,
+      moveit::core::RobotState& target)
+  {
+    const auto model = current.getRobotModel();
+    const auto* left_jmg = model->getJointModelGroup("left_ur_onrobot_manipulator");
+    const auto* right_jmg = model->getJointModelGroup("right_ur_onrobot_manipulator");
+    const auto* dual_jmg = model->getJointModelGroup("dual_arms");
+    if (!left_jmg || !right_jmg || !dual_jmg)
+      return false;
+
+    target = current;
+
+    auto solve_one = [&](const moveit::core::JointModelGroup* jmg,
+                         const Eigen::Isometry3d& pose,
+                         const std::string& tip) {
+      for (int attempt = 0; attempt < 12; ++attempt) {
+        moveit::core::RobotState trial(target);
+        if (attempt > 0)
+          trial.setToRandomPositions(jmg);
+
+        if (!trial.setFromIK(jmg, pose, tip, 0.15))
+          continue;
+
+        trial.update();
+        if (!trial.satisfiesBounds(jmg))
+          continue;
+
+        std::vector<double> q;
+        trial.copyJointGroupPositions(jmg, q);
+        normalizeGroupNearState(model, jmg, current, q);
+        target.setJointGroupPositions(jmg, q);
+        target.update();
+        return true;
+      }
+      return false;
+    };
+
+    if (left_pose && !solve_one(left_jmg, *left_pose, "left_gripper_tcp"))
+      return false;
+    if (right_pose && !solve_one(right_jmg, *right_pose, "right_gripper_tcp"))
+      return false;
+
+    return target.satisfiesBounds(dual_jmg);
+  }
+
+  moveit_msgs::msg::Constraints buildHoldConstraints(
+      const moveit::core::RobotState& state,
+      const moveit::core::JointModelGroup* hold_jmg)
+  {
+    moveit_msgs::msg::Constraints constraints;
+    std::vector<double> q;
+    state.copyJointGroupPositions(hold_jmg, q);
+    const auto& names = hold_jmg->getVariableNames();
+
+    for (std::size_t i = 0; i < names.size(); ++i) {
+      moveit_msgs::msg::JointConstraint jc;
+      jc.joint_name = names[i];
+      jc.position = q[i];
+      jc.tolerance_above = 0.005;
+      jc.tolerance_below = 0.005;
+      jc.weight = 1.0;
+      constraints.joint_constraints.push_back(jc);
+    }
+    return constraints;
+  }
+
+  bool buildDualPoseTarget(
+      const planning_scene::PlanningScenePtr& scene,
+      const moveit::core::RobotState& current,
+      const Eigen::Isometry3d* left_pose,
+      const Eigen::Isometry3d* right_pose,
+      moveit::core::RobotState& target)
+  {
+    const auto model = scene->getRobotModel();
+    const auto* left_jmg = model->getJointModelGroup("left_ur_onrobot_manipulator");
+    const auto* right_jmg = model->getJointModelGroup("right_ur_onrobot_manipulator");
+    const auto* dual_jmg = model->getJointModelGroup("dual_arms");
+    if (!left_jmg || !right_jmg || !dual_jmg)
+      return false;
+
+    const ArmConfig left{"left_ur_onrobot_manipulator", "left_ur_onrobot_gripper", "left_gripper_tcp", "left_object"};
+    const ArmConfig right{"right_ur_onrobot_manipulator", "right_ur_onrobot_gripper", "right_gripper_tcp", "right_object"};
+
+    target = current;
+
+    if (left_pose) {
+      moveit::core::RobotState left_solution(model);
+      if (!solveIKCollisionFree(scene, left, *left_pose, target, left_solution, 25))
+        return false;
+      std::vector<double> q;
+      left_solution.copyJointGroupPositions(left_jmg, q);
+      normalizeGroupNearState(model, left_jmg, current, q);
+      target.setJointGroupPositions(left_jmg, q);
+      target.update();
+    }
+
+    if (right_pose) {
+      moveit::core::RobotState right_solution(model);
+      if (!solveIKCollisionFree(scene, right, *right_pose, target, right_solution, 25))
+        return false;
+      std::vector<double> q;
+      right_solution.copyJointGroupPositions(right_jmg, q);
+      normalizeGroupNearState(model, right_jmg, current, q);
+      target.setJointGroupPositions(right_jmg, q);
+      target.update();
+    }
+
+    if (!target.satisfiesBounds(dual_jmg))
+      return false;
+    return !scene->isStateColliding(target, "", false);
+  }
+
+  bool planExecuteDualState(
+      moveit::planning_interface::MoveGroupInterface& dual_group,
+      const moveit::core::RobotState& start,
+      const moveit::core::RobotState& target,
+      HoldMode hold_mode,
+      const std::string& phase_name)
+  {
+    const auto model = dual_group.getRobotModel();
+    const auto* dual_jmg = model->getJointModelGroup("dual_arms");
+    const auto* left_jmg = model->getJointModelGroup("left_ur_onrobot_manipulator");
+    const auto* right_jmg = model->getJointModelGroup("right_ur_onrobot_manipulator");
+    if (!dual_jmg || !left_jmg || !right_jmg)
+      return false;
+
+    std::vector<double> q;
+    target.copyJointGroupPositions(dual_jmg, q);
+
+    dual_group.setPlannerId("RRTConnectkConfigDefault");
+    dual_group.setPlanningTime(10.0);
+    dual_group.setNumPlanningAttempts(5);
+    dual_group.setMaxVelocityScalingFactor(0.30);
+    dual_group.setMaxAccelerationScalingFactor(0.25);
+    dual_group.setStartState(start);
+    dual_group.setJointValueTarget(q);
+
+    if (hold_mode == HoldMode::HOLD_LEFT)
+      dual_group.setPathConstraints(buildHoldConstraints(start, left_jmg));
+    else if (hold_mode == HoldMode::HOLD_RIGHT)
+      dual_group.setPathConstraints(buildHoldConstraints(start, right_jmg));
+    else
+      dual_group.clearPathConstraints();
+
+    RCLCPP_INFO(LOGGER, "[%s] planning dual_arms 12DOF...", phase_name.c_str());
+    moveit::planning_interface::MoveGroupInterface::Plan plan;
+    const auto result = dual_group.plan(plan);
+    dual_group.clearPathConstraints();
+
+    if (result != moveit::core::MoveItErrorCode::SUCCESS) {
+      RCLCPP_ERROR(LOGGER, "[%s] PLAN FAILED", phase_name.c_str());
+      return false;
+    }
+
+    RCLCPP_INFO(LOGGER, "[%s] PLAN SUCCESS: joints=%zu points=%zu", phase_name.c_str(),
+                plan.trajectory_.joint_trajectory.joint_names.size(),
+                plan.trajectory_.joint_trajectory.points.size());
+
+    const bool execute = node_->get_parameter("execute").as_bool();
+    if (!execute) {
+      RCLCPP_INFO(LOGGER, "[%s] plan-only; execute:=true de robot chay.", phase_name.c_str());
+      return true;
+    }
+
+    const auto exec_result = dual_group.execute(plan);
+    if (exec_result != moveit::core::MoveItErrorCode::SUCCESS) {
+      RCLCPP_ERROR(LOGGER, "[%s] EXECUTION FAILED", phase_name.c_str());
+      return false;
+    }
+    RCLCPP_INFO(LOGGER, "[%s] EXECUTION SUCCESS", phase_name.c_str());
+    return true;
+  }
+
+  bool parallelMove(
+      moveit::planning_interface::MoveGroupInterface& dual_group,
+      const planning_scene::PlanningScenePtr& scene,
+      const Eigen::Isometry3d& left_target,
+      const Eigen::Isometry3d& right_target,
+      const std::string& name)
+  {
+    auto current = dual_group.getCurrentState(5.0);
+    if (!current)
+      return false;
+    scene->setCurrentState(*current);
+    moveit::core::RobotState target(*current);
+    if (!buildDualPoseTarget(scene, *current, &left_target, &right_target, target)) {
+      RCLCPP_ERROR(LOGGER, "[%s] Khong tao duoc dual target collision-free", name.c_str());
+      return false;
+    }
+    return planExecuteDualState(dual_group, *current, target, HoldMode::NONE, name);
+  }
+
+  bool leftHoldRightMove(
+      moveit::planning_interface::MoveGroupInterface& dual_group,
+      const planning_scene::PlanningScenePtr& scene,
+      const Eigen::Isometry3d& right_target,
+      const std::string& name)
+  {
+    auto current = dual_group.getCurrentState(5.0);
+    if (!current)
+      return false;
+    scene->setCurrentState(*current);
+    moveit::core::RobotState target(*current);
+    if (!buildDualPoseTarget(scene, *current, nullptr, &right_target, target)) {
+      RCLCPP_ERROR(LOGGER, "[%s] Khong tao duoc RIGHT target", name.c_str());
+      return false;
+    }
+    return planExecuteDualState(dual_group, *current, target, HoldMode::HOLD_LEFT, name);
+  }
+
+  bool rightHoldLeftMove(
+      moveit::planning_interface::MoveGroupInterface& dual_group,
+      const planning_scene::PlanningScenePtr& scene,
+      const Eigen::Isometry3d& left_target,
+      const std::string& name)
+  {
+    auto current = dual_group.getCurrentState(5.0);
+    if (!current)
+      return false;
+    scene->setCurrentState(*current);
+    moveit::core::RobotState target(*current);
+    if (!buildDualPoseTarget(scene, *current, &left_target, nullptr, target)) {
+      RCLCPP_ERROR(LOGGER, "[%s] Khong tao duoc LEFT target", name.c_str());
+      return false;
+    }
+    return planExecuteDualState(dual_group, *current, target, HoldMode::HOLD_RIGHT, name);
+  }
+
+  bool findNearbyJointTarget(
+      const planning_scene::PlanningScenePtr& scene,
+      const moveit::core::RobotState& current,
+      bool move_left,
+      bool move_right,
+      double requested_delta,
+      moveit::core::RobotState& target)
+  {
+    const auto model = scene->getRobotModel();
+    const auto* left_jmg = model->getJointModelGroup("left_ur_onrobot_manipulator");
+    const auto* right_jmg = model->getJointModelGroup("right_ur_onrobot_manipulator");
+    const auto* dual_jmg = model->getJointModelGroup("dual_arms");
+
+    if (!left_jmg || !right_jmg || !dual_jmg)
+      return false;
+
+    std::vector<double> left_current;
+    std::vector<double> right_current;
+    current.copyJointGroupPositions(left_jmg, left_current);
+    current.copyJointGroupPositions(right_jmg, right_current);
+
+    struct Change
+    {
+      int index;
+      double delta;
+    };
+
+    std::vector<Change> left_changes;
+    std::vector<Change> right_changes;
+
+    if (move_left) {
+      for (std::size_t i = 0; i < left_current.size(); ++i) {
+        left_changes.push_back({static_cast<int>(i), requested_delta});
+        left_changes.push_back({static_cast<int>(i), -requested_delta});
+        left_changes.push_back({static_cast<int>(i), 0.5 * requested_delta});
+        left_changes.push_back({static_cast<int>(i), -0.5 * requested_delta});
+      }
+    }
+    else {
+      left_changes.push_back({-1, 0.0});
+    }
+
+    if (move_right) {
+      for (std::size_t i = 0; i < right_current.size(); ++i) {
+        right_changes.push_back({static_cast<int>(i), requested_delta});
+        right_changes.push_back({static_cast<int>(i), -requested_delta});
+        right_changes.push_back({static_cast<int>(i), 0.5 * requested_delta});
+        right_changes.push_back({static_cast<int>(i), -0.5 * requested_delta});
+      }
+    }
+    else {
+      right_changes.push_back({-1, 0.0});
+    }
+
+    for (const auto& lc : left_changes) {
+      for (const auto& rc : right_changes) {
+        std::vector<double> lq = left_current;
+        std::vector<double> rq = right_current;
+
+        if (lc.index >= 0)
+          lq[static_cast<std::size_t>(lc.index)] += lc.delta;
+        if (rc.index >= 0)
+          rq[static_cast<std::size_t>(rc.index)] += rc.delta;
+
+        moveit::core::RobotState trial(current);
+        trial.setJointGroupPositions(left_jmg, lq);
+        trial.setJointGroupPositions(right_jmg, rq);
+        trial.update();
+
+        if (!trial.satisfiesBounds(dual_jmg))
+          continue;
+
+        if (scene->isStateColliding(trial, "", false))
+          continue;
+
+        target = trial;
+
+        RCLCPP_INFO(
+            LOGGER,
+            "Nearby target FOUND: left_joint=%d d=%.3f rad, right_joint=%d d=%.3f rad",
+            lc.index, lc.delta, rc.index, rc.delta);
+
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  void runPrimitiveDemo()
+  {
+    moveit::planning_interface::MoveGroupInterface dual_group(node_, "dual_arms");
+    const auto model = dual_group.getRobotModel();
+    const auto* dual_jmg = model->getJointModelGroup("dual_arms");
+
+    if (!dual_jmg) {
+      RCLCPP_ERROR(LOGGER, "primitive_demo: khong tim thay dual_arms");
+      return;
+    }
+
+    auto home = dual_group.getCurrentState(5.0);
+    if (!home) {
+      RCLCPP_ERROR(LOGGER, "primitive_demo: khong doc duoc current state");
+      return;
+    }
+
+    moveit::planning_interface::PlanningSceneInterface psi;
+    auto scene = std::make_shared<planning_scene::PlanningScene>(model);
+    scene->setCurrentState(*home);
+
+    // Demo primitive chi can vat can la table.
+    // Khong dua left_object/right_object vao local IK/collision test de tranh
+    // lam bai test scheduler bi phu thuoc vao vi tri vat the.
+    const auto table_objects = psi.getObjects({"table"});
+    for (const auto& kv : table_objects)
+      scene->processCollisionObjectMsg(kv.second);
+
+    if (scene->isStateColliding(*home, "", false)) {
+      RCLCPP_ERROR(LOGGER, "primitive_demo: HOME dang collision trong local scene");
+      return;
+    }
+
+    const double joint_delta =
+        node_->get_parameter("demo_joint_delta").as_double();
+
+    RCLCPP_INFO(LOGGER, "==========================================");
+    RCLCPP_INFO(LOGGER, " PRIMITIVE DEMO V2 - dual_arms 12DOF");
+    RCLCPP_INFO(LOGGER, " P1 PARALLEL -> P2 LEFT HOLD -> P3 RIGHT HOLD -> P4 HOME");
+    RCLCPP_INFO(LOGGER, " Demo nay dung nearby JOINT targets de test kien truc, khong phu thuoc IK Cartesian.");
+    RCLCPP_INFO(LOGGER, "==========================================");
+
+    // PHASE 1: ca hai arm cung thay doi joint trong mot target 12DOF.
+    auto s0 = dual_group.getCurrentState(5.0);
+    if (!s0)
+      return;
+
+    scene->setCurrentState(*s0);
+    moveit::core::RobotState p1(*s0);
+
+    if (!findNearbyJointTarget(scene, *s0, true, true, joint_delta, p1)) {
+      RCLCPP_ERROR(LOGGER, "[PHASE1] Khong tim duoc nearby collision-free dual joint target");
+      return;
+    }
+
+    if (!planExecuteDualState(
+            dual_group, *s0, p1, HoldMode::NONE,
+            "PHASE1 PARALLEL LEFT+RIGHT"))
+      return;
+
+    if (!node_->get_parameter("execute").as_bool()) {
+      RCLCPP_WARN(
+          LOGGER,
+          "primitive_demo plan-only chi test PHASE1. Dung execute:=true de test du 4 phase.");
+      return;
+    }
+
+    // PHASE 2: LEFT giu nguyen, RIGHT thay doi.
+    auto s1 = dual_group.getCurrentState(5.0);
+    if (!s1)
+      return;
+
+    scene->setCurrentState(*s1);
+    moveit::core::RobotState p2(*s1);
+
+    if (!findNearbyJointTarget(scene, *s1, false, true, joint_delta, p2)) {
+      RCLCPP_ERROR(LOGGER, "[PHASE2] Khong tim duoc nearby RIGHT target");
+      return;
+    }
+
+    if (!planExecuteDualState(
+            dual_group, *s1, p2, HoldMode::HOLD_LEFT,
+            "PHASE2 LEFT HOLD + RIGHT MOVE"))
+      return;
+
+    // PHASE 3: RIGHT giu nguyen, LEFT thay doi.
+    auto s2 = dual_group.getCurrentState(5.0);
+    if (!s2)
+      return;
+
+    scene->setCurrentState(*s2);
+    moveit::core::RobotState p3(*s2);
+
+    if (!findNearbyJointTarget(scene, *s2, true, false, joint_delta, p3)) {
+      RCLCPP_ERROR(LOGGER, "[PHASE3] Khong tim duoc nearby LEFT target");
+      return;
+    }
+
+    if (!planExecuteDualState(
+            dual_group, *s2, p3, HoldMode::HOLD_RIGHT,
+            "PHASE3 RIGHT HOLD + LEFT MOVE"))
+      return;
+
+    // PHASE 4: ca hai cung tro ve state ban dau.
+    auto current = dual_group.getCurrentState(5.0);
+    if (!current)
+      return;
+
+    scene->setCurrentState(*current);
+
+    if (!planExecuteDualState(
+            dual_group, *current, *home, HoldMode::NONE,
+            "PHASE4 PARALLEL RETURN HOME"))
+      return;
+
+    RCLCPP_INFO(LOGGER, "==========================================");
+    RCLCPP_INFO(LOGGER, " PRIMITIVE DEMO V2 4 PHASE SUCCESS");
+    RCLCPP_INFO(LOGGER, "==========================================");
+  }
+
+  void runPoseDemo()
+  {
+    moveit::planning_interface::MoveGroupInterface dual_group(node_, "dual_arms");
+    const auto model = dual_group.getRobotModel();
+    const auto* left_jmg = model->getJointModelGroup("left_ur_onrobot_manipulator");
+    const auto* right_jmg = model->getJointModelGroup("right_ur_onrobot_manipulator");
+    const auto* dual_jmg = model->getJointModelGroup("dual_arms");
+
+    if (!left_jmg || !right_jmg || !dual_jmg) {
+      RCLCPP_ERROR(LOGGER, "POSE FAST: thieu JointModelGroup");
+      return;
+    }
+
+    std::vector<std::string> left_hand_links;
+    std::vector<std::string> right_hand_links;
+    DualTaskTargets targets;
+
+    try {
+      RCLCPP_INFO(LOGGER, "POSE FAST: tim PREGRASP/GRASP nhanh...");
+      targets = preparePickTargetsFast(model, left_hand_links, right_hand_links);
+    }
+    catch (const std::exception& e) {
+      RCLCPP_ERROR(LOGGER, "POSE FAST target search failed: %s", e.what());
+      return;
+    }
+
+    auto home = dual_group.getCurrentState(5.0);
+    if (!home) {
+      RCLCPP_ERROR(LOGGER, "POSE FAST: khong doc duoc current state");
+      return;
+    }
+
+    auto applyGoal = [](moveit::core::RobotState& state,
+                        const std::map<std::string, double>& goal) {
+      for (const auto& kv : goal)
+        state.setVariablePosition(kv.first, kv.second);
+      state.update();
+    };
+
+    moveit::core::RobotState pre(*home);
+    moveit::core::RobotState grasp(*home);
+    applyGoal(pre, targets.pregrasp);
+    applyGoal(grasp, targets.grasp);
+
+    std::vector<double> left_pre_q, right_pre_q;
+    std::vector<double> left_grasp_q, right_grasp_q;
+    pre.copyJointGroupPositions(left_jmg, left_pre_q);
+    pre.copyJointGroupPositions(right_jmg, right_pre_q);
+    grasp.copyJointGroupPositions(left_jmg, left_grasp_q);
+    grasp.copyJointGroupPositions(right_jmg, right_grasp_q);
+
+    // Move only part way from pregrasp to grasp so this test DOES NOT touch the objects.
+    constexpr double NEAR_FRACTION = 0.45;
+    std::vector<double> left_near_q(left_pre_q.size());
+    std::vector<double> right_near_q(right_pre_q.size());
+
+    for (std::size_t i = 0; i < left_pre_q.size(); ++i)
+      left_near_q[i] = left_pre_q[i] + NEAR_FRACTION * (left_grasp_q[i] - left_pre_q[i]);
+    for (std::size_t i = 0; i < right_pre_q.size(); ++i)
+      right_near_q[i] = right_pre_q[i] + NEAR_FRACTION * (right_grasp_q[i] - right_pre_q[i]);
+
+    double left_delta = 0.0;
+    double right_delta = 0.0;
+    std::vector<double> left_home_q, right_home_q;
+    home->copyJointGroupPositions(left_jmg, left_home_q);
+    home->copyJointGroupPositions(right_jmg, right_home_q);
+    for (std::size_t i = 0; i < left_pre_q.size(); ++i)
+      left_delta = std::max(left_delta, std::abs(left_pre_q[i] - left_home_q[i]));
+    for (std::size_t i = 0; i < right_pre_q.size(); ++i)
+      right_delta = std::max(right_delta, std::abs(right_pre_q[i] - right_home_q[i]));
+
+    RCLCPP_INFO(LOGGER,
+                "POSE FAST target ready: LEFT angle=%.0f RIGHT angle=%.0f; max joint delta to pregrasp LEFT=%.3f RIGHT=%.3f rad",
+                targets.left_angle * 180.0 / M_PI,
+                targets.right_angle * 180.0 / M_PI,
+                left_delta, right_delta);
+
+    RCLCPP_INFO(LOGGER, "==========================================");
+    RCLCPP_INFO(LOGGER, " POSE FAST DEMO START");
+    RCLCPP_INFO(LOGGER, " P1 BOTH -> PREGRASP");
+    RCLCPP_INFO(LOGGER, " P2 LEFT HOLD + RIGHT approach 45%%");
+    RCLCPP_INFO(LOGGER, " P3 RIGHT HOLD + LEFT approach 45%%");
+    RCLCPP_INFO(LOGGER, " P4 BOTH retreat -> PREGRASP");
+    RCLCPP_INFO(LOGGER, " P5 BOTH -> HOME");
+    RCLCPP_INFO(LOGGER, "==========================================");
+
+    if (!planExecuteDualState(dual_group, *home, pre, HoldMode::NONE,
+                              "POSE FAST P1 PARALLEL -> PREGRASP"))
+      return;
+
+    if (!node_->get_parameter("execute").as_bool()) {
+      RCLCPP_WARN(LOGGER, "execute:=false, dung sau P1 plan-only");
+      return;
+    }
+
+    auto s1 = dual_group.getCurrentState(5.0);
+    if (!s1)
+      return;
+    moveit::core::RobotState p2(*s1);
+    p2.setJointGroupPositions(right_jmg, right_near_q);
+    p2.update();
+    if (!planExecuteDualState(dual_group, *s1, p2, HoldMode::HOLD_LEFT,
+                              "POSE FAST P2 LEFT HOLD + RIGHT APPROACH"))
+      return;
+
+    auto s2 = dual_group.getCurrentState(5.0);
+    if (!s2)
+      return;
+    moveit::core::RobotState p3(*s2);
+    p3.setJointGroupPositions(left_jmg, left_near_q);
+    p3.update();
+    if (!planExecuteDualState(dual_group, *s2, p3, HoldMode::HOLD_RIGHT,
+                              "POSE FAST P3 RIGHT HOLD + LEFT APPROACH"))
+      return;
+
+    auto s3 = dual_group.getCurrentState(5.0);
+    if (!s3)
+      return;
+    if (!planExecuteDualState(dual_group, *s3, pre, HoldMode::NONE,
+                              "POSE FAST P4 PARALLEL RETREAT"))
+      return;
+
+    auto s4 = dual_group.getCurrentState(5.0);
+    if (!s4)
+      return;
+    if (!planExecuteDualState(dual_group, *s4, *home, HoldMode::NONE,
+                              "POSE FAST P5 PARALLEL HOME"))
+      return;
+
+    RCLCPP_INFO(LOGGER, "==========================================");
+    RCLCPP_INFO(LOGGER, " POSE FAST DEMO SUCCESS");
+    RCLCPP_INFO(LOGGER, "==========================================");
+  }
+
+  DualTaskTargets preparePickTargetsFast(
+      const moveit::core::RobotModelConstPtr& robot_model,
+      std::vector<std::string>& left_hand_links,
+      std::vector<std::string>& right_hand_links)
+  {
+    const ArmConfig left{
+        "left_ur_onrobot_manipulator",
+        "left_ur_onrobot_gripper",
+        "left_gripper_tcp",
+        "left_object"};
+
+    const ArmConfig right{
+        "right_ur_onrobot_manipulator",
+        "right_ur_onrobot_gripper",
+        "right_gripper_tcp",
+        "right_object"};
+
+    moveit::planning_interface::MoveGroupInterface dual_group(node_, "dual_arms");
+    auto current_state = dual_group.getCurrentState(5.0);
+
+    if (!current_state)
+      throw std::runtime_error("FAST PICK: khong doc duoc current state");
+
+    moveit::planning_interface::PlanningSceneInterface psi;
+    std::map<std::string, moveit_msgs::msg::CollisionObject> objects;
+
+    for (int i = 0; i < 40; ++i) {
+      objects = psi.getObjects({"table", left.object_name, right.object_name});
+      if (objects.count("table") &&
+          objects.count(left.object_name) &&
+          objects.count(right.object_name))
+        break;
+      rclcpp::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    if (!objects.count("table") ||
+        !objects.count(left.object_name) ||
+        !objects.count(right.object_name))
+      throw std::runtime_error("FAST PICK: PlanningScene thieu table/object");
+
+    const auto poses = psi.getObjectPoses({left.object_name, right.object_name});
+
+    if (!poses.count(left.object_name) || !poses.count(right.object_name))
+      throw std::runtime_error("FAST PICK: khong doc duoc pose object");
+
+    const Eigen::Isometry3d world_left_object =
+        poseToEigen(poses.at(left.object_name));
+    const Eigen::Isometry3d world_right_object =
+        poseToEigen(poses.at(right.object_name));
+
+    RCLCPP_INFO(
+        LOGGER,
+        "FAST PICK objects: LEFT(%.3f %.3f %.3f) RIGHT(%.3f %.3f %.3f)",
+        world_left_object.translation().x(),
+        world_left_object.translation().y(),
+        world_left_object.translation().z(),
+        world_right_object.translation().x(),
+        world_right_object.translation().y(),
+        world_right_object.translation().z());
+
+    auto scene = std::make_shared<planning_scene::PlanningScene>(robot_model);
+    scene->setCurrentState(*current_state);
+
+    for (const auto& kv : objects)
+      scene->processCollisionObjectMsg(kv.second);
+
+    const auto* left_jmg =
+        robot_model->getJointModelGroup(left.arm_group);
+    const auto* right_jmg =
+        robot_model->getJointModelGroup(right.arm_group);
+    const auto* dual_jmg =
+        robot_model->getJointModelGroup("dual_arms");
+    const auto* left_hand_jmg =
+        robot_model->getJointModelGroup(left.hand_group);
+    const auto* right_hand_jmg =
+        robot_model->getJointModelGroup(right.hand_group);
+
+    if (!left_jmg || !right_jmg || !dual_jmg ||
+        !left_hand_jmg || !right_hand_jmg)
+      throw std::runtime_error("FAST PICK: thieu JointModelGroup");
+
+    left_hand_links =
+        left_hand_jmg->getLinkModelNamesWithCollisionGeometry();
+    right_hand_links =
+        right_hand_jmg->getLinkModelNamesWithCollisionGeometry();
+
+    auto& acm = scene->getAllowedCollisionMatrixNonConst();
+    acm.setEntry(left.object_name, left_hand_links, true);
+    acm.setEntry(right.object_name, right_hand_links, true);
+    acm.setEntry(left_hand_links, left_hand_links, true);
+    acm.setEntry(right_hand_links, right_hand_links, true);
+
+    const Eigen::Isometry3d hand_tf = graspFrameTransform();
+    constexpr double APPROACH_DISTANCE = 0.05;
+    constexpr double LIFT_DISTANCE = 0.08;
+
+    // Search heuristic only: try around 260 deg first because it is good
+    // for the current symmetric scene, but ALWAYS falls back around 360 deg.
+    // Therefore 260 deg is not a fixed grasp requirement.
+    std::vector<int> angle_order;
+    angle_order.reserve(36);
+    const int seed_idx = 26;  // 260 deg search seed only
+
+    angle_order.push_back(seed_idx);
+    for (int d = 1; d < 36; ++d) {
+      const int plus = (seed_idx + d) % 36;
+      const int minus = (seed_idx - d + 36) % 36;
+
+      if (std::find(angle_order.begin(), angle_order.end(), plus) ==
+          angle_order.end())
+        angle_order.push_back(plus);
+
+      if (angle_order.size() >= 36)
+        break;
+
+      if (std::find(angle_order.begin(), angle_order.end(), minus) ==
+          angle_order.end())
+        angle_order.push_back(minus);
+
+      if (angle_order.size() >= 36)
+        break;
+    }
+
+    auto findLimitedCandidates =
+        [&](const ArmConfig& cfg,
+            const Eigen::Isometry3d& world_object,
+            const moveit::core::RobotState& seed,
+            std::size_t max_valid) {
+          std::vector<Candidate> out;
+
+          for (std::size_t order_i = 0;
+               order_i < angle_order.size() && out.size() < max_valid;
+               ++order_i) {
+            const int idx = angle_order[order_i];
+            const double angle = idx * M_PI / 18.0;
+
+            RCLCPP_INFO(
+                LOGGER,
+                "FAST PICK %s: try angle %.0f deg (%zu/%zu)",
+                cfg.arm_group.c_str(),
+                angle * 180.0 / M_PI,
+                order_i + 1,
+                angle_order.size());
+
+            const Eigen::Isometry3d object_grasp =
+                Eigen::Isometry3d(
+                    Eigen::AngleAxisd(angle, Eigen::Vector3d::UnitZ()));
+
+            const Eigen::Isometry3d world_hand_grasp =
+                world_object * object_grasp * hand_tf.inverse();
+
+            const Eigen::Isometry3d world_hand_pregrasp =
+                world_hand_grasp *
+                Eigen::Translation3d(0.0, 0.0, -APPROACH_DISTANCE);
+
+            moveit::core::RobotState grasp(robot_model);
+            if (!solveIKCollisionFree(
+                    scene, cfg, world_hand_grasp, seed, grasp, 6))
+              continue;
+
+            moveit::core::RobotState pregrasp(robot_model);
+            if (!solveIKCollisionFree(
+                    scene, cfg, world_hand_pregrasp, grasp, pregrasp, 6))
+              continue;
+
+            if (!validateApproach(
+                    scene, cfg, world_hand_grasp, pregrasp))
+              continue;
+
+            Candidate c(robot_model);
+            c.pregrasp = pregrasp;
+            c.grasp = grasp;
+            c.angle = angle;
+            out.push_back(c);
+
+            RCLCPP_INFO(
+                LOGGER,
+                "FAST PICK %s: valid angle %.0f deg",
+                cfg.arm_group.c_str(),
+                angle * 180.0 / M_PI);
+          }
+
+          return out;
+        };
+
+    RCLCPP_INFO(LOGGER, "FAST PICK: searching LEFT candidates...");
+    auto left_candidates =
+        findLimitedCandidates(
+            left, world_left_object, *current_state, 4);
+
+    RCLCPP_INFO(
+        LOGGER,
+        "FAST PICK: LEFT valid candidates=%zu",
+        left_candidates.size());
+
+    RCLCPP_INFO(LOGGER, "FAST PICK: searching RIGHT candidates...");
+    auto right_candidates =
+        findLimitedCandidates(
+            right, world_right_object, *current_state, 4);
+
+    RCLCPP_INFO(
+        LOGGER,
+        "FAST PICK: RIGHT valid candidates=%zu",
+        right_candidates.size());
+
+    if (left_candidates.empty() || right_candidates.empty())
+      throw std::runtime_error(
+          "FAST PICK: khong tim duoc grasp candidate");
+
+    std::vector<double> left_current_q;
+    std::vector<double> right_current_q;
+    current_state->copyJointGroupPositions(left_jmg, left_current_q);
+    current_state->copyJointGroupPositions(right_jmg, right_current_q);
+
+    struct RankedPair
+    {
+      std::size_t li;
+      std::size_t ri;
+      double score;
+    };
+
+    std::vector<RankedPair> pairs;
+
+    for (std::size_t li = 0; li < left_candidates.size(); ++li) {
+      std::vector<double> lq;
+      left_candidates[li].pregrasp.copyJointGroupPositions(left_jmg, lq);
+      normalizeGroupNearState(
+          robot_model, left_jmg, *current_state, lq);
+
+      for (std::size_t ri = 0; ri < right_candidates.size(); ++ri) {
+        std::vector<double> rq;
+        right_candidates[ri].pregrasp.copyJointGroupPositions(right_jmg, rq);
+        normalizeGroupNearState(
+            robot_model, right_jmg, *current_state, rq);
+
+        double max_delta = 0.0;
+        const double score =
+            jointTravelScore(
+                lq, rq,
+                left_current_q, right_current_q,
+                max_delta);
+
+        pairs.push_back({li, ri, score});
+      }
+    }
+
+    std::sort(
+        pairs.begin(), pairs.end(),
+        [](const RankedPair& a, const RankedPair& b) {
+          return a.score < b.score;
+        });
+
+    moveit::core::RobotState best_pre(*current_state);
+    moveit::core::RobotState best_grasp(*current_state);
+    moveit::core::RobotState best_lift(*current_state);
+
+    bool found = false;
+    double best_score = 0.0;
+    double best_left_angle = 0.0;
+    double best_right_angle = 0.0;
+
+    for (std::size_t p = 0; p < pairs.size(); ++p) {
+      const auto& lp = left_candidates[pairs[p].li];
+      const auto& rp = right_candidates[pairs[p].ri];
+
+      RCLCPP_INFO(
+          LOGGER,
+          "FAST PICK pair %zu/%zu: LEFT=%.0f RIGHT=%.0f score=%.3f",
+          p + 1, pairs.size(),
+          lp.angle * 180.0 / M_PI,
+          rp.angle * 180.0 / M_PI,
+          pairs[p].score);
+
+      std::vector<double> left_pre_q;
+      std::vector<double> right_pre_q;
+      lp.pregrasp.copyJointGroupPositions(left_jmg, left_pre_q);
+      rp.pregrasp.copyJointGroupPositions(right_jmg, right_pre_q);
+
+      normalizeGroupNearState(
+          robot_model, left_jmg, *current_state, left_pre_q);
+      normalizeGroupNearState(
+          robot_model, right_jmg, *current_state, right_pre_q);
+
+      moveit::core::RobotState pre(*current_state);
+      pre.setJointGroupPositions(left_jmg, left_pre_q);
+      pre.setJointGroupPositions(right_jmg, right_pre_q);
+      pre.update();
+
+      if (!pre.satisfiesBounds(dual_jmg) ||
+          scene->isStateColliding(pre, "", false))
+        continue;
+
+      std::vector<double> left_grasp_q;
+      std::vector<double> right_grasp_q;
+      lp.grasp.copyJointGroupPositions(left_jmg, left_grasp_q);
+      rp.grasp.copyJointGroupPositions(right_jmg, right_grasp_q);
+
+      normalizeGroupNearState(
+          robot_model, left_jmg, pre, left_grasp_q);
+      normalizeGroupNearState(
+          robot_model, right_jmg, pre, right_grasp_q);
+
+      moveit::core::RobotState grasp(pre);
+      grasp.setJointGroupPositions(left_jmg, left_grasp_q);
+      grasp.setJointGroupPositions(right_jmg, right_grasp_q);
+      grasp.update();
+
+      if (!grasp.satisfiesBounds(dual_jmg) ||
+          scene->isStateColliding(grasp, "", false))
+        continue;
+
+      if (!validateDualInterpolation(
+              scene, pre, grasp, dual_jmg, 20))
+        continue;
+
+      const Eigen::Isometry3d left_object_grasp =
+          Eigen::Isometry3d(
+              Eigen::AngleAxisd(
+                  lp.angle, Eigen::Vector3d::UnitZ()));
+
+      const Eigen::Isometry3d right_object_grasp =
+          Eigen::Isometry3d(
+              Eigen::AngleAxisd(
+                  rp.angle, Eigen::Vector3d::UnitZ()));
+
+      Eigen::Isometry3d world_left_hand_lift =
+          world_left_object *
+          left_object_grasp *
+          hand_tf.inverse();
+
+      Eigen::Isometry3d world_right_hand_lift =
+          world_right_object *
+          right_object_grasp *
+          hand_tf.inverse();
+
+      world_left_hand_lift.translation().z() += LIFT_DISTANCE;
+      world_right_hand_lift.translation().z() += LIFT_DISTANCE;
+
+      moveit::core::RobotState left_lift(robot_model);
+      moveit::core::RobotState right_lift(robot_model);
+
+      if (!solveIKCollisionFree(
+              scene, left,
+              world_left_hand_lift,
+              grasp, left_lift, 10))
+        continue;
+
+      if (!solveIKCollisionFree(
+              scene, right,
+              world_right_hand_lift,
+              grasp, right_lift, 10))
+        continue;
+
+      std::vector<double> left_lift_q;
+      std::vector<double> right_lift_q;
+
+      left_lift.copyJointGroupPositions(
+          left_jmg, left_lift_q);
+      right_lift.copyJointGroupPositions(
+          right_jmg, right_lift_q);
+
+      normalizeGroupNearState(
+          robot_model, left_jmg, grasp, left_lift_q);
+      normalizeGroupNearState(
+          robot_model, right_jmg, grasp, right_lift_q);
+
+      moveit::core::RobotState lift(grasp);
+      lift.setJointGroupPositions(left_jmg, left_lift_q);
+      lift.setJointGroupPositions(right_jmg, right_lift_q);
+      lift.update();
+
+      if (!lift.satisfiesBounds(dual_jmg) ||
+          scene->isStateColliding(lift, "", false))
+        continue;
+
+      if (!validateDualInterpolation(
+              scene, grasp, lift, dual_jmg, 20))
+        continue;
+
+      best_pre = pre;
+      best_grasp = grasp;
+      best_lift = lift;
+      best_score = pairs[p].score;
+      best_left_angle = lp.angle;
+      best_right_angle = rp.angle;
+      found = true;
+
+      RCLCPP_INFO(
+          LOGGER,
+          "FAST PICK ACCEPTED: LEFT=%.0f RIGHT=%.0f score=%.3f",
+          best_left_angle * 180.0 / M_PI,
+          best_right_angle * 180.0 / M_PI,
+          best_score);
+
+      break;
+    }
+
+    if (!found)
+      throw std::runtime_error(
+          "FAST PICK: khong tim duoc dual pair PREGRASP->GRASP->LIFT");
+
+    DualTaskTargets targets;
+    targets.pregrasp = groupGoal(best_pre, dual_jmg);
+    targets.grasp = groupGoal(best_grasp, dual_jmg);
+    targets.lift = groupGoal(best_lift, dual_jmg);
+    targets.home = groupGoal(*current_state, dual_jmg);
+    targets.left_angle = best_left_angle;
+    targets.right_angle = best_right_angle;
+    targets.score = best_score;
+
+    return targets;
+  }
+
+  DualTaskTargets prepareTargets(
+      const moveit::core::RobotModelConstPtr& robot_model,
+      std::vector<std::string>& left_hand_links,
+      std::vector<std::string>& right_hand_links)
+  {
+    const ArmConfig left{
+        "left_ur_onrobot_manipulator",
+        "left_ur_onrobot_gripper",
+        "left_gripper_tcp",
+        "left_object"};
+
+    const ArmConfig right{
+        "right_ur_onrobot_manipulator",
+        "right_ur_onrobot_gripper",
+        "right_gripper_tcp",
+        "right_object"};
+
+    moveit::planning_interface::MoveGroupInterface dual_group(node_, "dual_arms");
+    auto current_state = dual_group.getCurrentState(5.0);
+
+    if (!current_state)
+      throw std::runtime_error("Khong doc duoc current state");
+
+    moveit::planning_interface::PlanningSceneInterface psi;
+    std::map<std::string, moveit_msgs::msg::CollisionObject> objects;
+
+    for (int i = 0; i < 40; ++i) {
+      objects = psi.getObjects({"table", left.object_name, right.object_name});
+
+      if (objects.count("table") &&
+          objects.count(left.object_name) &&
+          objects.count(right.object_name))
+        break;
+
+      rclcpp::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    if (!objects.count("table") ||
+        !objects.count(left.object_name) ||
+        !objects.count(right.object_name))
+      throw std::runtime_error("PlanningScene thieu table/object");
+
+    const auto poses = psi.getObjectPoses({left.object_name, right.object_name});
+
+    if (!poses.count(left.object_name) || !poses.count(right.object_name))
+      throw std::runtime_error("Khong doc duoc world pose cua 2 object");
+
+    const Eigen::Isometry3d world_left_object = poseToEigen(poses.at(left.object_name));
+    const Eigen::Isometry3d world_right_object = poseToEigen(poses.at(right.object_name));
+
+    RCLCPP_INFO(
+        LOGGER,
+        "Objects: LEFT(%.3f %.3f %.3f) RIGHT(%.3f %.3f %.3f)",
+        world_left_object.translation().x(),
+        world_left_object.translation().y(),
+        world_left_object.translation().z(),
+        world_right_object.translation().x(),
+        world_right_object.translation().y(),
+        world_right_object.translation().z());
+
+    auto scene = std::make_shared<planning_scene::PlanningScene>(robot_model);
+    scene->setCurrentState(*current_state);
+
+    for (const auto& kv : objects)
+      scene->processCollisionObjectMsg(kv.second);
+
+    const auto* left_jmg = robot_model->getJointModelGroup(left.arm_group);
+    const auto* right_jmg = robot_model->getJointModelGroup(right.arm_group);
+    const auto* dual_jmg = robot_model->getJointModelGroup("dual_arms");
+    const auto* left_hand_jmg = robot_model->getJointModelGroup(left.hand_group);
+    const auto* right_hand_jmg = robot_model->getJointModelGroup(right.hand_group);
+
+    if (!left_jmg || !right_jmg || !dual_jmg || !left_hand_jmg || !right_hand_jmg)
+      throw std::runtime_error("Thieu JointModelGroup");
+
+    left_hand_links = left_hand_jmg->getLinkModelNamesWithCollisionGeometry();
+    right_hand_links = right_hand_jmg->getLinkModelNamesWithCollisionGeometry();
+
+    auto& acm = scene->getAllowedCollisionMatrixNonConst();
+    acm.setEntry(left.object_name, left_hand_links, true);
+    acm.setEntry(right.object_name, right_hand_links, true);
+    acm.setEntry(left_hand_links, left_hand_links, true);
+    acm.setEntry(right_hand_links, right_hand_links, true);
+
+    auto left_candidates =
+        findCandidates(scene, left, world_left_object, *current_state);
+    auto right_candidates =
+        findCandidates(scene, right, world_right_object, *current_state);
+
+    RCLCPP_INFO(
+        LOGGER,
+        "Grasp candidates: LEFT=%zu RIGHT=%zu",
+        left_candidates.size(),
+        right_candidates.size());
+
+    if (left_candidates.empty() || right_candidates.empty())
+      throw std::runtime_error("Khong tim duoc grasp candidate");
+
+    std::vector<double> left_current_q;
+    std::vector<double> right_current_q;
+    current_state->copyJointGroupPositions(left_jmg, left_current_q);
+    current_state->copyJointGroupPositions(right_jmg, right_current_q);
+
+    // Rank tung candidate bang quang duong joint re: CURRENT -> PREGRASP -> GRASP.
+    // Chi giu TOP_K moi tay de khong lam no so cap full-cycle.
+    constexpr std::size_t TOP_K_PER_ARM = 12;
+
+    auto rankArmCandidates = [&](std::vector<Candidate>& candidates,
+                                 const moveit::core::JointModelGroup* jmg,
+                                 const std::vector<double>& current_q) {
+      for (auto& c : candidates) {
+        std::vector<double> pre_q;
+        std::vector<double> grasp_q;
+        c.pregrasp.copyJointGroupPositions(jmg, pre_q);
+        normalizeGroupNearState(robot_model, jmg, *current_state, pre_q);
+
+        moveit::core::RobotState pre(*current_state);
+        pre.setJointGroupPositions(jmg, pre_q);
+        pre.update();
+
+        c.grasp.copyJointGroupPositions(jmg, grasp_q);
+        normalizeGroupNearState(robot_model, jmg, pre, grasp_q);
+
+        double sum = 0.0;
+        double max_delta = 0.0;
+        for (std::size_t i = 0; i < pre_q.size(); ++i) {
+          const double d0 = std::abs(pre_q[i] - current_q[i]);
+          const double d1 = std::abs(grasp_q[i] - pre_q[i]);
+          sum += d0 + d1;
+          max_delta = std::max(max_delta, d0);
+        }
+        c.rank_score = sum + 2.0 * max_delta;
+      }
+
+      std::sort(candidates.begin(), candidates.end(),
+                [](const Candidate& a, const Candidate& b) {
+                  return a.rank_score < b.rank_score;
+                });
+
+      if (candidates.size() > TOP_K_PER_ARM)
+        candidates.erase(candidates.begin() + TOP_K_PER_ARM, candidates.end());
+    };
+
+    rankArmCandidates(left_candidates, left_jmg, left_current_q);
+    rankArmCandidates(right_candidates, right_jmg, right_current_q);
+
+    RCLCPP_INFO(LOGGER,
+                "Ranked candidates kept: LEFT=%zu RIGHT=%zu; best LEFT=%.0f deg cost=%.3f; best RIGHT=%.0f deg cost=%.3f",
+                left_candidates.size(), right_candidates.size(),
+                left_candidates.front().angle * 180.0 / M_PI, left_candidates.front().rank_score,
+                right_candidates.front().angle * 180.0 / M_PI, right_candidates.front().rank_score);
+
+    const Eigen::Isometry3d hand_tf = graspFrameTransform();
+
+    const double left_place_x = node_->get_parameter("left_place_x").as_double();
+    const double left_place_y = node_->get_parameter("left_place_y").as_double();
+    const double left_place_z = node_->get_parameter("left_place_z").as_double();
+
+    const double right_place_x = node_->get_parameter("right_place_x").as_double();
+    const double right_place_y = node_->get_parameter("right_place_y").as_double();
+    const double right_place_z = node_->get_parameter("right_place_z").as_double();
+
+    const double left_roll =
+        node_->get_parameter("left_place_roll_deg").as_double() * M_PI / 180.0;
+    const double left_pitch =
+        node_->get_parameter("left_place_pitch_deg").as_double() * M_PI / 180.0;
+    const double left_yaw =
+        node_->get_parameter("left_place_yaw_deg").as_double() * M_PI / 180.0;
+
+    const double right_roll =
+        node_->get_parameter("right_place_roll_deg").as_double() * M_PI / 180.0;
+    const double right_pitch =
+        node_->get_parameter("right_place_pitch_deg").as_double() * M_PI / 180.0;
+    const double right_yaw =
+        node_->get_parameter("right_place_yaw_deg").as_double() * M_PI / 180.0;
+
+    Eigen::Isometry3d world_left_place_object = world_left_object;
+    Eigen::Isometry3d world_right_place_object = world_right_object;
+
+    world_left_place_object.translation() =
+        Eigen::Vector3d(left_place_x, left_place_y, left_place_z);
+    world_right_place_object.translation() =
+        Eigen::Vector3d(right_place_x, right_place_y, right_place_z);
+
+    const Eigen::Matrix3d left_offset =
+        (Eigen::AngleAxisd(left_yaw, Eigen::Vector3d::UnitZ()) *
+         Eigen::AngleAxisd(left_pitch, Eigen::Vector3d::UnitY()) *
+         Eigen::AngleAxisd(left_roll, Eigen::Vector3d::UnitX())).toRotationMatrix();
+
+    const Eigen::Matrix3d right_offset =
+        (Eigen::AngleAxisd(right_yaw, Eigen::Vector3d::UnitZ()) *
+         Eigen::AngleAxisd(right_pitch, Eigen::Vector3d::UnitY()) *
+         Eigen::AngleAxisd(right_roll, Eigen::Vector3d::UnitX())).toRotationMatrix();
+
+    world_left_place_object.linear() =
+        left_offset * world_left_object.linear();
+    world_right_place_object.linear() =
+        right_offset * world_right_object.linear();
+
+    RCLCPP_INFO(
+        LOGGER,
+        "Requested PLACE: LEFT(%.3f %.3f %.3f) RPYoff=(%.1f %.1f %.1f deg) "
+        "RIGHT(%.3f %.3f %.3f) RPYoff=(%.1f %.1f %.1f deg)",
+        left_place_x, left_place_y, left_place_z,
+        left_roll * 180.0 / M_PI,
+        left_pitch * 180.0 / M_PI,
+        left_yaw * 180.0 / M_PI,
+        right_place_x, right_place_y, right_place_z,
+        right_roll * 180.0 / M_PI,
+        right_pitch * 180.0 / M_PI,
+        right_yaw * 180.0 / M_PI);
+
+    const double place_distance =
+        std::sqrt(
+            std::pow(left_place_x - right_place_x, 2.0) +
+            std::pow(left_place_y - right_place_y, 2.0) +
+            std::pow(left_place_z - right_place_z, 2.0));
+
+    RCLCPP_INFO(LOGGER, "Distance between place targets: %.3f m", place_distance);
+
+    if (place_distance < 0.06) {
+      RCLCPP_WARN(
+          LOGGER,
+          "Hai vi tri place rat gan nhau (%.3f m). Planner co the reject do object/gripper collision.",
+          place_distance);
+    }
+
+    moveit::core::RobotState best_pre(*current_state);
+    moveit::core::RobotState best_grasp(*current_state);
+    moveit::core::RobotState best_lift(*current_state);
+    moveit::core::RobotState best_preplace(*current_state);
+    moveit::core::RobotState best_place(*current_state);
+
+    bool found_full_pair = false;
+    double best_score = std::numeric_limits<double>::infinity();
+    double best_max_delta = 0.0;
+    double left_angle = 0.0;
+    double right_angle = 0.0;
+
+    int pair_count = 0;
+    int grasp_ok = 0;
+    int lift_ok = 0;
+    int preplace_ok = 0;
+    int place_ok = 0;
+
+    auto stateTravel = [&](const moveit::core::RobotState& a,
+                           const moveit::core::RobotState& b) {
+      std::vector<double> qa;
+      std::vector<double> qb;
+      a.copyJointGroupPositions(dual_jmg, qa);
+      b.copyJointGroupPositions(dual_jmg, qb);
+
+      double sum = 0.0;
+      for (std::size_t i = 0; i < qa.size(); ++i)
+        sum += std::abs(qb[i] - qa[i]);
+
+      return sum;
+    };
+
+    struct RankedPair
+    {
+      std::size_t left_idx;
+      std::size_t right_idx;
+      double quick_score;
+    };
+
+    std::vector<RankedPair> ranked_pairs;
+    ranked_pairs.reserve(left_candidates.size() * right_candidates.size());
+
+    for (std::size_t li = 0; li < left_candidates.size(); ++li) {
+      for (std::size_t ri = 0; ri < right_candidates.size(); ++ri) {
+        ranked_pairs.push_back(
+            RankedPair{li, ri,
+                       left_candidates[li].rank_score +
+                       right_candidates[ri].rank_score});
+      }
+    }
+
+    std::sort(ranked_pairs.begin(), ranked_pairs.end(),
+              [](const RankedPair& a, const RankedPair& b) {
+                return a.quick_score < b.quick_score;
+              });
+
+    RCLCPP_INFO(LOGGER,
+                "Ranked %zu dual pairs by cheap joint cost. Testing FULL cycle from cheapest...",
+                ranked_pairs.size());
+
+    for (const auto& rp : ranked_pairs) {
+      const auto& lc = left_candidates[rp.left_idx];
+      const auto& rc = right_candidates[rp.right_idx];
+      ++pair_count;
+
+      RCLCPP_INFO(LOGGER,
+                  "FULL test %d/%zu: LEFT=%.0f RIGHT=%.0f quick_cost=%.3f",
+                  pair_count, ranked_pairs.size(),
+                  lc.angle * 180.0 / M_PI,
+                  rc.angle * 180.0 / M_PI,
+                  rp.quick_score);
+
+      std::vector<double> left_pre_q;
+      std::vector<double> right_pre_q;
+      lc.pregrasp.copyJointGroupPositions(left_jmg, left_pre_q);
+      rc.pregrasp.copyJointGroupPositions(right_jmg, right_pre_q);
+      normalizeGroupNearState(robot_model, left_jmg, *current_state, left_pre_q);
+      normalizeGroupNearState(robot_model, right_jmg, *current_state, right_pre_q);
+
+      moveit::core::RobotState pre(*current_state);
+      pre.setJointGroupPositions(left_jmg, left_pre_q);
+      pre.setJointGroupPositions(right_jmg, right_pre_q);
+      pre.update();
+
+      if (!pre.satisfiesBounds(dual_jmg) ||
+          scene->isStateColliding(pre, "", false))
+        continue;
+
+      std::vector<double> left_grasp_q;
+      std::vector<double> right_grasp_q;
+      lc.grasp.copyJointGroupPositions(left_jmg, left_grasp_q);
+      rc.grasp.copyJointGroupPositions(right_jmg, right_grasp_q);
+      normalizeGroupNearState(robot_model, left_jmg, pre, left_grasp_q);
+      normalizeGroupNearState(robot_model, right_jmg, pre, right_grasp_q);
+
+      moveit::core::RobotState grasp(pre);
+      grasp.setJointGroupPositions(left_jmg, left_grasp_q);
+      grasp.setJointGroupPositions(right_jmg, right_grasp_q);
+      grasp.update();
+
+      if (!grasp.satisfiesBounds(dual_jmg) ||
+          scene->isStateColliding(grasp, "", false))
+        continue;
+
+      if (!validateDualInterpolation(scene, pre, grasp, dual_jmg))
+        continue;
+
+      ++grasp_ok;
+
+      const Eigen::Isometry3d left_object_grasp =
+          Eigen::Isometry3d(
+              Eigen::AngleAxisd(lc.angle, Eigen::Vector3d::UnitZ()));
+      const Eigen::Isometry3d right_object_grasp =
+          Eigen::Isometry3d(
+              Eigen::AngleAxisd(rc.angle, Eigen::Vector3d::UnitZ()));
+
+      const Eigen::Isometry3d world_left_hand_grasp =
+          world_left_object * left_object_grasp * hand_tf.inverse();
+      const Eigen::Isometry3d world_right_hand_grasp =
+          world_right_object * right_object_grasp * hand_tf.inverse();
+
+      Eigen::Isometry3d world_left_hand_lift = world_left_hand_grasp;
+      Eigen::Isometry3d world_right_hand_lift = world_right_hand_grasp;
+      world_left_hand_lift.translation().z() += 0.08;
+      world_right_hand_lift.translation().z() += 0.08;
+
+      moveit::core::RobotState left_lift(robot_model);
+      moveit::core::RobotState right_lift(robot_model);
+
+      if (!solveIKCollisionFree(
+              scene, left, world_left_hand_lift, grasp, left_lift, 25))
+        continue;
+      if (!solveIKCollisionFree(
+              scene, right, world_right_hand_lift, grasp, right_lift, 25))
+        continue;
+
+      std::vector<double> left_lift_q;
+      std::vector<double> right_lift_q;
+      left_lift.copyJointGroupPositions(left_jmg, left_lift_q);
+      right_lift.copyJointGroupPositions(right_jmg, right_lift_q);
+      normalizeGroupNearState(robot_model, left_jmg, grasp, left_lift_q);
+      normalizeGroupNearState(robot_model, right_jmg, grasp, right_lift_q);
+
+      moveit::core::RobotState combined_lift(grasp);
+      combined_lift.setJointGroupPositions(left_jmg, left_lift_q);
+      combined_lift.setJointGroupPositions(right_jmg, right_lift_q);
+      combined_lift.update();
+
+      if (!combined_lift.satisfiesBounds(dual_jmg) ||
+          scene->isStateColliding(combined_lift, "", false))
+        continue;
+      if (!validateDualInterpolation(scene, grasp, combined_lift, dual_jmg, 30))
+        continue;
+
+      ++lift_ok;
+
+      const Eigen::Isometry3d world_left_hand_place =
+          world_left_place_object * left_object_grasp * hand_tf.inverse();
+      const Eigen::Isometry3d world_right_hand_place =
+          world_right_place_object * right_object_grasp * hand_tf.inverse();
+
+      Eigen::Isometry3d world_left_hand_preplace = world_left_hand_place;
+      Eigen::Isometry3d world_right_hand_preplace = world_right_hand_place;
+      world_left_hand_preplace.translation().z() += 0.08;
+      world_right_hand_preplace.translation().z() += 0.08;
+
+      moveit::core::RobotState left_preplace(robot_model);
+      moveit::core::RobotState right_preplace(robot_model);
+
+      if (!solveIKCollisionFree(
+              scene, left, world_left_hand_preplace,
+              combined_lift, left_preplace, 20))
+        continue;
+      if (!solveIKCollisionFree(
+              scene, right, world_right_hand_preplace,
+              combined_lift, right_preplace, 20))
+        continue;
+
+      std::vector<double> left_preplace_q;
+      std::vector<double> right_preplace_q;
+      left_preplace.copyJointGroupPositions(left_jmg, left_preplace_q);
+      right_preplace.copyJointGroupPositions(right_jmg, right_preplace_q);
+      normalizeGroupNearState(robot_model, left_jmg, combined_lift, left_preplace_q);
+      normalizeGroupNearState(robot_model, right_jmg, combined_lift, right_preplace_q);
+
+      moveit::core::RobotState combined_preplace(combined_lift);
+      combined_preplace.setJointGroupPositions(left_jmg, left_preplace_q);
+      combined_preplace.setJointGroupPositions(right_jmg, right_preplace_q);
+      combined_preplace.update();
+
+      if (!combined_preplace.satisfiesBounds(dual_jmg) ||
+          scene->isStateColliding(combined_preplace, "", false))
+        continue;
+
+      ++preplace_ok;
+
+      moveit::core::RobotState left_place(robot_model);
+      moveit::core::RobotState right_place(robot_model);
+
+      if (!solveIKCollisionFree(
+              scene, left, world_left_hand_place,
+              combined_preplace, left_place, 20))
+        continue;
+      if (!solveIKCollisionFree(
+              scene, right, world_right_hand_place,
+              combined_preplace, right_place, 20))
+        continue;
+
+      std::vector<double> left_place_q;
+      std::vector<double> right_place_q;
+      left_place.copyJointGroupPositions(left_jmg, left_place_q);
+      right_place.copyJointGroupPositions(right_jmg, right_place_q);
+      normalizeGroupNearState(robot_model, left_jmg, combined_preplace, left_place_q);
+      normalizeGroupNearState(robot_model, right_jmg, combined_preplace, right_place_q);
+
+      moveit::core::RobotState combined_place(combined_preplace);
+      combined_place.setJointGroupPositions(left_jmg, left_place_q);
+      combined_place.setJointGroupPositions(right_jmg, right_place_q);
+
+      if (!combined_place.setToDefaultValues(left_hand_jmg, "open") ||
+          !combined_place.setToDefaultValues(right_hand_jmg, "open"))
+        throw std::runtime_error("Khong tim thay named state open cua gripper");
+
+      combined_place.update();
+
+      if (!combined_place.satisfiesBounds(dual_jmg) ||
+          scene->isStateColliding(combined_place, "", false))
+        continue;
+      if (!validateDualInterpolation(
+              scene, combined_preplace, combined_place, dual_jmg, 30))
+        continue;
+
+      ++place_ok;
+
+      double max_delta = 0.0;
+      const double pick_score = jointTravelScore(
+          left_pre_q, right_pre_q,
+          left_current_q, right_current_q,
+          max_delta);
+
+      const double full_score =
+          pick_score +
+          stateTravel(pre, grasp) +
+          stateTravel(grasp, combined_lift) +
+          stateTravel(combined_lift, combined_preplace) +
+          stateTravel(combined_preplace, combined_place);
+
+      best_score = full_score;
+      best_max_delta = max_delta;
+      best_pre = pre;
+      best_grasp = grasp;
+      best_lift = combined_lift;
+      best_preplace = combined_preplace;
+      best_place = combined_place;
+      left_angle = lc.angle;
+      right_angle = rc.angle;
+      found_full_pair = true;
+
+      RCLCPP_INFO(LOGGER,
+                  "RANKED FULL pair ACCEPTED: LEFT=%.0f RIGHT=%.0f quick=%.3f full=%.3f max_delta=%.3f",
+                  lc.angle * 180.0 / M_PI,
+                  rc.angle * 180.0 / M_PI,
+                  rp.quick_score,
+                  full_score,
+                  max_delta);
+      break;
+    }
+
+    RCLCPP_INFO(
+        LOGGER,
+        "Pair search: total=%d grasp_ok=%d lift_ok=%d preplace_ok=%d place_ok=%d",
+        pair_count,
+        grasp_ok,
+        lift_ok,
+        preplace_ok,
+        place_ok);
+
+    if (!found_full_pair)
+      throw std::runtime_error(
+          "Khong tim duoc cap grasp nao di duoc tron PICK -> LIFT -> PLACE");
+
+    RCLCPP_INFO(
+        LOGGER,
+        "Selected RANKED FULL-CYCLE pair: LEFT=%.0f RIGHT=%.0f score=%.3f max_delta=%.3f",
+        left_angle * 180.0 / M_PI,
+        right_angle * 180.0 / M_PI,
+        best_score,
+        best_max_delta);
+
+    RCLCPP_INFO(
+        LOGGER,
+        "Release check: grippers OPEN collision-free; object-table contact allowed only during PLACE");
+
+    DualTaskTargets targets;
+    targets.pregrasp = groupGoal(best_pre, dual_jmg);
+    targets.grasp = groupGoal(best_grasp, dual_jmg);
+    targets.lift = groupGoal(best_lift, dual_jmg);
+    targets.preplace = groupGoal(best_preplace, dual_jmg);
+    targets.place = groupGoal(best_place, dual_jmg);
+    targets.home = groupGoal(*current_state, dual_jmg);
+    targets.left_angle = left_angle;
+    targets.right_angle = right_angle;
+    targets.score = best_score;
+    return targets;
+  }
+
+  mtc::Task createDualPickDemoTask()
+  {
+    mtc::Task task;
+    task.stages()->setName("dual_pick_parallel_cycle");
+    task.loadRobotModel(node_);
+
+    std::vector<std::string> left_hand_links;
+    std::vector<std::string> right_hand_links;
+
+    // Reuse the already proven object-aware target generator.
+    // It returns synchronized 12DOF pregrasp/grasp/lift states.
+    const auto targets =
+        preparePickTargetsFast(task.getRobotModel(), left_hand_links, right_hand_links);
+
+    auto sampling =
+        std::make_shared<mtc::solvers::PipelinePlanner>(node_);
+    sampling->setProperty("planning_pipeline", "ompl");
+    sampling->setPlannerId("RRTConnectkConfigDefault");
+
+    auto interpolation =
+        std::make_shared<mtc::solvers::JointInterpolationPlanner>();
+
+    task.add(std::make_unique<mtc::stages::CurrentState>("current state"));
+
+    {
+      auto allow =
+          std::make_unique<mtc::stages::ModifyPlanningScene>(
+              "allow grasp collisions");
+      allow->allowCollisions("left_object", left_hand_links, true);
+      allow->allowCollisions("right_object", right_hand_links, true);
+      allow->allowCollisions(left_hand_links, left_hand_links, true);
+      allow->allowCollisions(right_hand_links, right_hand_links, true);
+      task.add(std::move(allow));
+    }
+
+    {
+      auto open =
+          std::make_unique<mtc::stages::MoveTo>(
+              "open both grippers", interpolation);
+      open->setGroup("dual_grippers");
+      open->setGoal(std::map<std::string, double>{
+          {"left_finger_width", 0.100},
+          {"right_finger_width", 0.100}});
+      task.add(std::move(open));
+    }
+
+    {
+      auto move =
+          std::make_unique<mtc::stages::MoveTo>(
+              "P1 parallel move to dual pregrasp", sampling);
+      move->setGroup("dual_arms");
+      move->setGoal(targets.pregrasp);
+      move->setTimeout(15.0);
+      task.add(std::move(move));
+    }
+
+    {
+      auto approach =
+          std::make_unique<mtc::stages::MoveTo>(
+              "P2 synchronized dual approach", interpolation);
+      approach->setGroup("dual_arms");
+      approach->setGoal(targets.grasp);
+      task.add(std::move(approach));
+    }
+
+    {
+      auto close =
+          std::make_unique<mtc::stages::MoveTo>(
+              "P3 close both grippers", interpolation);
+      close->setGroup("dual_grippers");
+      close->setGoal(std::map<std::string, double>{
+          {"left_finger_width", 0.0},
+          {"right_finger_width", 0.0}});
+      task.add(std::move(close));
+    }
+
+    {
+      auto attach_left =
+          std::make_unique<mtc::stages::ModifyPlanningScene>(
+              "P4 attach left object");
+      attach_left->attachObject("left_object", "left_gripper_tcp");
+      task.add(std::move(attach_left));
+
+      auto attach_right =
+          std::make_unique<mtc::stages::ModifyPlanningScene>(
+              "P4 attach right object");
+      attach_right->attachObject("right_object", "right_gripper_tcp");
+      task.add(std::move(attach_right));
+    }
+
+    {
+      auto lift =
+          std::make_unique<mtc::stages::MoveTo>(
+              "P5 synchronized dual lift", interpolation);
+      lift->setGroup("dual_arms");
+      lift->setGoal(targets.lift);
+      task.add(std::move(lift));
+    }
+
+    // Put-back portion keeps the demo repeatable and leaves the scene clean.
+    {
+      auto allow_table =
+          std::make_unique<mtc::stages::ModifyPlanningScene>(
+              "allow objects contact table for put-back");
+      allow_table->allowCollisions("left_object", "table", true);
+      allow_table->allowCollisions("right_object", "table", true);
+      task.add(std::move(allow_table));
+    }
+
+    {
+      auto lower =
+          std::make_unique<mtc::stages::MoveTo>(
+              "P6 synchronized put-back", interpolation);
+      lower->setGroup("dual_arms");
+      lower->setGoal(targets.grasp);
+      task.add(std::move(lower));
+    }
+
+    {
+      auto open =
+          std::make_unique<mtc::stages::MoveTo>(
+              "P7 open both grippers", interpolation);
+      open->setGroup("dual_grippers");
+      open->setGoal(std::map<std::string, double>{
+          {"left_finger_width", 0.100},
+          {"right_finger_width", 0.100}});
+      task.add(std::move(open));
+    }
+
+    {
+      auto detach_left =
+          std::make_unique<mtc::stages::ModifyPlanningScene>(
+              "P8 detach left object");
+      detach_left->detachObject("left_object", "left_gripper_tcp");
+      task.add(std::move(detach_left));
+
+      auto detach_right =
+          std::make_unique<mtc::stages::ModifyPlanningScene>(
+              "P8 detach right object");
+      detach_right->detachObject("right_object", "right_gripper_tcp");
+      task.add(std::move(detach_right));
+    }
+
+    {
+      auto restore =
+          std::make_unique<mtc::stages::ModifyPlanningScene>(
+              "restore collision rules");
+      restore->allowCollisions("left_object", left_hand_links, false);
+      restore->allowCollisions("right_object", right_hand_links, false);
+      restore->allowCollisions("left_object", "table", false);
+      restore->allowCollisions("right_object", "table", false);
+      task.add(std::move(restore));
+    }
+
+    {
+      auto retreat =
+          std::make_unique<mtc::stages::MoveTo>(
+              "P9 synchronized retreat", interpolation);
+      retreat->setGroup("dual_arms");
+      retreat->setGoal(targets.pregrasp);
+      task.add(std::move(retreat));
+    }
+
+    {
+      auto home =
+          std::make_unique<mtc::stages::MoveTo>(
+              "P10 parallel return home", sampling);
+      home->setGroup("dual_arms");
+      home->setGoal(targets.home);
+      home->setTimeout(15.0);
+      task.add(std::move(home));
+    }
+
+    return task;
+  }
+
+  mtc::Task createTask()
+  {
+    mtc::Task task;
+    task.stages()->setName("dual_arms_12dof_full_pick_place");
+    task.loadRobotModel(node_);
+
+    std::vector<std::string> left_hand_links;
+    std::vector<std::string> right_hand_links;
+
+    const auto targets =
+        prepareTargets(task.getRobotModel(), left_hand_links, right_hand_links);
+
+    auto sampling = std::make_shared<mtc::solvers::PipelinePlanner>(node_);
+    sampling->setProperty("planning_pipeline", "ompl");
+    sampling->setPlannerId("RRTConnectkConfigDefault");
+
+    auto interpolation =
+        std::make_shared<mtc::solvers::JointInterpolationPlanner>();
+
+    task.add(std::make_unique<mtc::stages::CurrentState>("current state"));
+
+    {
+      auto allow =
+          std::make_unique<mtc::stages::ModifyPlanningScene>("allow grasp collisions");
+      allow->allowCollisions("left_object", left_hand_links, true);
+      allow->allowCollisions("right_object", right_hand_links, true);
+      allow->allowCollisions(left_hand_links, left_hand_links, true);
+      allow->allowCollisions(right_hand_links, right_hand_links, true);
+      task.add(std::move(allow));
+    }
+
+    {
+      auto open = std::make_unique<mtc::stages::MoveTo>(
+          "open both grippers", interpolation);
+      open->setGroup("dual_grippers");
+      open->setGoal(std::map<std::string, double>{
+          {"left_finger_width", 0.100},
+          {"right_finger_width", 0.100}});
+      task.add(std::move(open));
+    }
+
+    {
+      auto move = std::make_unique<mtc::stages::MoveTo>(
+          "dual move to pre-grasp", sampling);
+      move->setGroup("dual_arms");
+      move->setGoal(targets.pregrasp);
+      move->setTimeout(15.0);
+      task.add(std::move(move));
+    }
+
+    {
+      auto approach = std::make_unique<mtc::stages::MoveTo>(
+          "dual synchronized approach to grasp", interpolation);
+      approach->setGroup("dual_arms");
+      approach->setGoal(targets.grasp);
+      task.add(std::move(approach));
+    }
+
+    {
+      auto close = std::make_unique<mtc::stages::MoveTo>(
+          "close both grippers", interpolation);
+      close->setGroup("dual_grippers");
+      close->setGoal(std::map<std::string, double>{
+          {"left_finger_width", 0.0},
+          {"right_finger_width", 0.0}});
+      task.add(std::move(close));
+    }
+
+    {
+      auto attach_left =
+          std::make_unique<mtc::stages::ModifyPlanningScene>("attach left object");
+      attach_left->attachObject("left_object", "left_gripper_tcp");
+      task.add(std::move(attach_left));
+
+      auto attach_right =
+          std::make_unique<mtc::stages::ModifyPlanningScene>("attach right object");
+      attach_right->attachObject("right_object", "right_gripper_tcp");
+      task.add(std::move(attach_right));
+    }
+
+    {
+      auto lift = std::make_unique<mtc::stages::MoveTo>(
+          "dual synchronized lift", interpolation);
+      lift->setGroup("dual_arms");
+      lift->setGoal(targets.lift);
+      task.add(std::move(lift));
+    }
+
+    {
+      // Khi dat vat len ban, attached object duoc phep tiep xuc voi mat ban.
+      // Chi allow object <-> table, KHONG allow arm/gripper <-> table.
+      auto allow_place_contact =
+          std::make_unique<mtc::stages::ModifyPlanningScene>(
+              "allow objects contact table at place");
+      allow_place_contact->allowCollisions("left_object", "table", true);
+      allow_place_contact->allowCollisions("right_object", "table", true);
+      task.add(std::move(allow_place_contact));
+    }
+
+    {
+      auto move = std::make_unique<mtc::stages::MoveTo>(
+          "dual move to pre-place", sampling);
+      move->setGroup("dual_arms");
+      move->setGoal(targets.preplace);
+      move->setTimeout(15.0);
+      task.add(std::move(move));
+    }
+
+    {
+      auto descend = std::make_unique<mtc::stages::MoveTo>(
+          "dual synchronized descend to place", interpolation);
+      descend->setGroup("dual_arms");
+      descend->setGoal(targets.place);
+      task.add(std::move(descend));
+    }
+
+    {
+      auto open = std::make_unique<mtc::stages::MoveTo>(
+          "open both grippers at place", interpolation);
+      open->setGroup("dual_grippers");
+      open->setGoal(std::map<std::string, double>{
+          {"left_finger_width", 0.100},
+          {"right_finger_width", 0.100}});
+      task.add(std::move(open));
+    }
+
+    {
+      auto detach_left =
+          std::make_unique<mtc::stages::ModifyPlanningScene>(
+              "detach left object");
+      detach_left->detachObject("left_object", "left_gripper_tcp");
+      task.add(std::move(detach_left));
+
+      auto detach_right =
+          std::make_unique<mtc::stages::ModifyPlanningScene>(
+              "detach right object");
+      detach_right->detachObject("right_object", "right_gripper_tcp");
+      task.add(std::move(detach_right));
+    }
+
+    {
+      auto forbid =
+          std::make_unique<mtc::stages::ModifyPlanningScene>(
+              "restore object collision rules");
+      forbid->allowCollisions("left_object", left_hand_links, false);
+      forbid->allowCollisions("right_object", right_hand_links, false);
+      forbid->allowCollisions("left_object", "table", false);
+      forbid->allowCollisions("right_object", "table", false);
+      task.add(std::move(forbid));
+    }
+
+    {
+      auto retreat = std::make_unique<mtc::stages::MoveTo>(
+          "dual synchronized retreat", interpolation);
+      retreat->setGroup("dual_arms");
+      retreat->setGoal(targets.preplace);
+      task.add(std::move(retreat));
+    }
+
+    {
+      auto home = std::make_unique<mtc::stages::MoveTo>(
+          "dual return home", sampling);
+      home->setGroup("dual_arms");
+      home->setGoal(targets.home);
+      home->setTimeout(15.0);
+      task.add(std::move(home));
+    }
+
+    return task;
+  }
+
+  rclcpp::Node::SharedPtr node_;
+  mtc::Task task_;
+};
+
+int main(int argc, char** argv)
+{
+  rclcpp::init(argc, argv);
+
+  rclcpp::NodeOptions options;
+  options.automatically_declare_parameters_from_overrides(true);
+
+  auto node = std::make_shared<DualArmMTCNode>(options);
+
+  auto base = node->getNodeBaseInterface();
+  rclcpp::executors::MultiThreadedExecutor executor;
+  executor.add_node(base);
+
+  std::thread spin_thread([&executor]() { executor.spin(); });
+
+  std::this_thread::sleep_for(std::chrono::seconds(1));
+  node->run();
+
+  rclcpp::shutdown();
+  spin_thread.join();
+  return 0;
+}

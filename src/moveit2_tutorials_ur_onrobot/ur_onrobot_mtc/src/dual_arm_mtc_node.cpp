@@ -1,328 +1,361 @@
-#include <memory>
-#include <thread>
-#include <chrono>
-#include <cmath>
-#include <iostream>
-#include <vector>
-#include <string>
-#include <stdexcept>
-
 #include <rclcpp/rclcpp.hpp>
-#include <moveit/planning_scene/planning_scene.h>
-#include <moveit/planning_scene_interface/planning_scene_interface.h>
-#include <moveit/task_constructor/task.h>
-#include <moveit/task_constructor/solvers.h>
-#include <moveit/task_constructor/stages.h>
-#include <Eigen/Geometry>
-#include <geometry_msgs/msg/pose.hpp>
-#include <geometry_msgs/msg/pose_stamped.hpp>
-#include <geometry_msgs/msg/vector3_stamped.hpp>
-#include <moveit_msgs/msg/move_it_error_codes.hpp>
+#include <std_msgs/msg/string.hpp>
 
-static const rclcpp::Logger LOGGER = rclcpp::get_logger("dual_arm_mtc_node");
-namespace mtc = moveit::task_constructor;
+#include <chrono>
+#include <condition_variable>
+#include <deque>
+#include <memory>
+#include <limits>
+#include <mutex>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <vector>
+#include <cmath>
 
-class DualArmMTCTaskNode
+#include "ur_onrobot_mtc/dual_arm_interface.hpp"
+#include "ur_onrobot_mtc/tasks/pick_task.hpp"
+#include "ur_onrobot_mtc/tasks/place_task.hpp"
+#include "ur_onrobot_mtc/tasks/move_task.hpp"
+#include "ur_onrobot_mtc/tasks/mission_task.hpp"
+#include "ur_onrobot_mtc/tasks/robot_selector.hpp"
+#include "ur_onrobot_mtc/tasks/stack_task.hpp"
+#include "ur_onrobot_mtc/tasks/swap_task.hpp"
+
+namespace ur_onrobot_mtc
+{
+
+class CommandDispatcher
 {
 public:
-  explicit DualArmMTCTaskNode(const rclcpp::NodeOptions& options);
-  rclcpp::node_interfaces::NodeBaseInterface::SharedPtr getNodeBaseInterface();
-  void doTask();
+  explicit CommandDispatcher(std::shared_ptr<DualArmInterface> robot)
+    : robot_(std::move(robot))
+  {
+    selector_ = std::make_shared<RobotSelector>(robot_);
+    pick_task_ = std::make_shared<PickTask>(robot_, selector_);
+    place_task_ = std::make_shared<PlaceTask>(robot_);
+    move_task_ = std::make_shared<MoveTask>(robot_);
+    stack_task_ = std::make_shared<StackTask>(robot_);
+    swap_task_ = std::make_shared<SwapTask>(robot_);
+    mission_task_ = std::make_shared<MissionTask>(robot_);
+
+    command_sub_ = robot_->node()->create_subscription<std_msgs::msg::String>(
+        "/robot_command",
+        10,
+        [this](const std_msgs::msg::String::SharedPtr msg) {
+          if (!msg || msg->data.empty())
+            return;
+
+          {
+            std::lock_guard<std::mutex> lock(mutex_);
+            queue_.push_back(msg->data);
+          }
+          cv_.notify_one();
+        });
+
+    worker_ = std::thread([this]() { workerLoop(); });
+  }
+
+  ~CommandDispatcher()
+  {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      stop_ = true;
+    }
+    cv_.notify_all();
+
+    if (worker_.joinable())
+      worker_.join();
+  }
+
+  void printHelp() const
+  {
+    auto logger = robot_->node()->get_logger();
+
+    RCLCPP_INFO(logger, "==========================================");
+    RCLCPP_INFO(logger, " DUAL ARM COMMAND SERVER");
+    RCLCPP_INFO(logger, "==========================================");
+    RCLCPP_INFO(logger, " pick A [auto|left|right]");
+    RCLCPP_INFO(logger, " place A x y z [yaw_deg]");
+    RCLCPP_INFO(logger, " move A x y z [yaw_deg]");
+    RCLCPP_INFO(logger, " stack A B C D        # dual-pick in pairs, stack at first object x/y");
+    RCLCPP_INFO(logger, " stack_at x y A B C D # dual-pick in pairs, explicit stack target");
+    RCLCPP_INFO(logger, " swap A B");
+    RCLCPP_INFO(logger, " mission <name>           # run a predefined mission");
+    RCLCPP_INFO(logger, " missions                 # list predefined missions");
+    RCLCPP_INFO(logger, " status");
+    RCLCPP_INFO(logger, " reset_scene");
+    RCLCPP_INFO(logger, " help");
+    RCLCPP_INFO(logger, "==========================================");
+  }
 
 private:
-  mtc::Task createUnifiedDualArmTask();
-  void addArmPickPlaceSequence(mtc::Task& task, 
-                               mtc::Stage* current_state_ptr,
-                               const std::string& arm_prefix, 
-                               const std::string& object_name, 
-                               double place_x,
-                               std::shared_ptr<mtc::solvers::PipelinePlanner> sampling_planner,
-                               std::shared_ptr<mtc::solvers::JointInterpolationPlanner> interpolation_planner,
-                               std::shared_ptr<mtc::solvers::CartesianPath> cartesian_planner);
+  void workerLoop()
+  {
+    while (rclcpp::ok()) {
+      std::string command;
 
-  rclcpp::Node::SharedPtr node_;
+      {
+        std::unique_lock<std::mutex> lock(mutex_);
+        cv_.wait(lock, [this]() {
+          return stop_ || !queue_.empty() || !rclcpp::ok();
+        });
+
+        if (stop_ || !rclcpp::ok())
+          return;
+
+        command = queue_.front();
+        queue_.pop_front();
+      }
+
+      RCLCPP_INFO(
+          robot_->node()->get_logger(),
+          "COMMAND START: %s",
+          command.c_str());
+
+      const bool ok = executeCommand(command);
+
+      if (ok) {
+        RCLCPP_INFO(
+            robot_->node()->get_logger(),
+            "COMMAND SUCCESS: %s",
+            command.c_str());
+      }
+      else {
+        RCLCPP_ERROR(
+            robot_->node()->get_logger(),
+            "COMMAND FAILED: %s",
+            command.c_str());
+      }
+    }
+  }
+
+  bool executeCommand(const std::string& command)
+  {
+    std::istringstream ss(command);
+    std::string op;
+    ss >> op;
+
+    if (op.empty())
+      return false;
+
+    if (op == "help") {
+      printHelp();
+      return true;
+    }
+
+    if (op == "status") {
+      robot_->printStatus();
+      return true;
+    }
+
+    if (op == "reset_scene")
+      return robot_->resetScene();
+
+    if (op == "missions") {
+      mission_task_->printAvailable();
+      return true;
+    }
+
+    if (op == "mission") {
+      std::string mission_name;
+      if (!(ss >> mission_name)) {
+        RCLCPP_ERROR(robot_->node()->get_logger(),
+                     "Usage: mission <name>");
+        mission_task_->printAvailable();
+        return false;
+      }
+
+      // A mission runs synchronously inside the same command worker.
+      // Incoming terminal commands remain queued until the mission finishes.
+      return mission_task_->execute(
+          mission_name,
+          [this](const std::string& step_command) {
+            return executeCommand(step_command);
+          });
+    }
+
+    if (op == "pick") {
+      std::string object;
+      std::string arm_text = "auto";
+      ss >> object;
+
+      if (object.empty()) {
+        RCLCPP_ERROR(robot_->node()->get_logger(),
+                     "Usage: pick <object> [auto|left|right]");
+        return false;
+      }
+
+      if (ss >> arm_text) {
+        // Optional arm was supplied.
+      }
+
+      const ArmSide arm = DualArmInterface::parseArmSide(arm_text);
+      if (arm == ArmSide::NONE) {
+        RCLCPP_ERROR(robot_->node()->get_logger(),
+                     "Invalid arm: %s", arm_text.c_str());
+        return false;
+      }
+
+      return pick_task_->execute(object, arm);
+    }
+
+    if (op == "place") {
+      std::string object;
+      double x = 0.0;
+      double y = 0.0;
+      double z = 0.0;
+
+      if (!(ss >> object >> x >> y >> z)) {
+        RCLCPP_ERROR(robot_->node()->get_logger(),
+                     "Usage: place <object> <x> <y> <z> [yaw_deg]");
+        return false;
+      }
+
+      // No yaw in the command means AUTO orientation.
+      // A finite yaw is used only when the user explicitly supplies it.
+      double yaw_rad = std::numeric_limits<double>::quiet_NaN();
+      double yaw_deg = 0.0;
+      if (ss >> yaw_deg)
+        yaw_rad = yaw_deg * M_PI / 180.0;
+
+      return place_task_->execute(object, x, y, z, yaw_rad);
+    }
+
+    if (op == "move") {
+      std::string object;
+      double x = 0.0;
+      double y = 0.0;
+      double z = 0.0;
+
+      if (!(ss >> object >> x >> y >> z)) {
+        RCLCPP_ERROR(robot_->node()->get_logger(),
+                     "Usage: move <object> <x> <y> <z> [yaw_deg]");
+        return false;
+      }
+
+      // NaN means: the user did not request a fixed yaw.
+      // DualArmInterface::moveObject() will choose a feasible orientation.
+      double yaw_rad = std::numeric_limits<double>::quiet_NaN();
+      double yaw_deg = 0.0;
+      if (ss >> yaw_deg)
+        yaw_rad = yaw_deg * M_PI / 180.0;
+
+      return move_task_->execute(object, x, y, z, yaw_rad);
+    }
+
+    if (op == "stack" || op == "stack_at") {
+      double center_x = 0.0;
+      double center_y = 0.0;
+
+      if (op == "stack_at") {
+        if (!(ss >> center_x >> center_y)) {
+          RCLCPP_ERROR(robot_->node()->get_logger(),
+                       "Usage: stack_at <x> <y> <object1> <object2> ...");
+          return false;
+        }
+      }
+
+      std::vector<std::string> objects;
+      std::string object;
+      while (ss >> object)
+        objects.push_back(object);
+
+      if (objects.empty()) {
+        RCLCPP_ERROR(robot_->node()->get_logger(),
+                     "Usage: stack <object1> <object2> ...");
+        return false;
+      }
+
+      // Dynamic default: plain `stack A B ...` stacks at the CURRENT x/y of
+      // the first object. No stack-center pose is taken from the launch file.
+      if (op == "stack") {
+        double object_z = 0.0;
+        if (!robot_->getObjectPose(objects.front(), center_x, center_y, object_z)) {
+          RCLCPP_ERROR(robot_->node()->get_logger(),
+                       "STACK: cannot read current pose of %s from PlanningScene",
+                       objects.front().c_str());
+          return false;
+        }
+
+        RCLCPP_INFO(robot_->node()->get_logger(),
+                    "STACK dynamic target from first object %s: (%.3f, %.3f)",
+                    objects.front().c_str(), center_x, center_y);
+      }
+
+      return stack_task_->execute(objects, center_x, center_y);
+    }
+
+    if (op == "swap") {
+      std::string a;
+      std::string b;
+
+      if (!(ss >> a >> b)) {
+        RCLCPP_ERROR(robot_->node()->get_logger(),
+                     "Usage: swap <objectA> <objectB>");
+        return false;
+      }
+
+      return swap_task_->execute(a, b);
+    }
+
+    RCLCPP_ERROR(robot_->node()->get_logger(),
+                 "Unknown command: %s", op.c_str());
+    return false;
+  }
+
+  std::shared_ptr<DualArmInterface> robot_;
+  std::shared_ptr<RobotSelector> selector_;
+  std::shared_ptr<PickTask> pick_task_;
+  std::shared_ptr<PlaceTask> place_task_;
+  std::shared_ptr<MoveTask> move_task_;
+  std::shared_ptr<StackTask> stack_task_;
+  std::shared_ptr<SwapTask> swap_task_;
+  std::shared_ptr<MissionTask> mission_task_;
+
+  rclcpp::Subscription<std_msgs::msg::String>::SharedPtr command_sub_;
+
+  std::deque<std::string> queue_;
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  std::thread worker_;
+  bool stop_ = false;
 };
 
-rclcpp::node_interfaces::NodeBaseInterface::SharedPtr DualArmMTCTaskNode::getNodeBaseInterface()
-{
-  return node_->get_node_base_interface();
-}
-
-DualArmMTCTaskNode::DualArmMTCTaskNode(const rclcpp::NodeOptions& options)
-  : node_{ std::make_shared<rclcpp::Node>("dual_arm_mtc_node", options) }
-{
-}
-
-void DualArmMTCTaskNode::addArmPickPlaceSequence(
-    mtc::Task& task, 
-    mtc::Stage* current_state_ptr,
-    const std::string& arm_prefix, 
-    const std::string& object_name, 
-    double place_x,
-    std::shared_ptr<mtc::solvers::PipelinePlanner> sampling_planner,
-    std::shared_ptr<mtc::solvers::JointInterpolationPlanner> interpolation_planner,
-    std::shared_ptr<mtc::solvers::CartesianPath> cartesian_planner)
-{
-  const std::string arm_group = arm_prefix + "_ur_onrobot_manipulator";
-  const std::string hand_group = arm_prefix + "_ur_onrobot_gripper";
-  const std::string hand_frame = arm_prefix + "_gripper_tcp";
-  const std::string home_pose = arm_prefix + "_test_configuration";
-  const std::string table_name = "table";
-
-  const auto* hand_jmg = task.getRobotModel()->getJointModelGroup(hand_group);
-  if (!hand_jmg) {
-    throw std::runtime_error("Không tìm thấy JointModelGroup: " + hand_group);
-  }
-  const auto hand_links = hand_jmg->getLinkModelNamesWithCollisionGeometry();
-
-  // 1. Mở tay kẹp
-  auto open_hand = std::make_unique<mtc::stages::MoveTo>("open hand " + arm_prefix, interpolation_planner);
-  open_hand->setGroup(hand_group);
-  open_hand->setGoal("open");
-  task.add(std::move(open_hand));
-
-  // 2. Di chuyển đến điểm gắp
-  auto move_pick = std::make_unique<mtc::stages::Connect>(
-      "move to pick " + arm_prefix, mtc::stages::Connect::GroupPlannerVector{ { arm_group, sampling_planner } });
-  move_pick->setTimeout(15.0);
-  move_pick->properties().configureInitFrom(mtc::Stage::PARENT);
-  task.add(std::move(move_pick));
-
-  mtc::Stage* attach_stage = nullptr;
-
-  // 3. Chuỗi Pick
-  {
-    auto grasp = std::make_unique<mtc::SerialContainer>("pick object " + arm_prefix);
-    grasp->setProperty("group", arm_group);
-    grasp->setProperty("eef", hand_group);
-    grasp->setProperty("ik_frame", hand_frame);
-
-    // Bỏ qua va chạm
-    auto allow_coll = std::make_unique<mtc::stages::ModifyPlanningScene>("allow collision " + arm_prefix);
-    allow_coll->allowCollisions(object_name, hand_links, true);
-    allow_coll->allowCollisions(hand_links, hand_links, true);
-    allow_coll->allowCollisions(table_name, hand_links, true);
-    grasp->insert(std::move(allow_coll));
-
-    // Tiếp cận vật
-    auto approach = std::make_unique<mtc::stages::MoveRelative>("approach object " + arm_prefix, cartesian_planner);
-    approach->properties().set("marker_ns", "approach_" + arm_prefix);
-    approach->properties().set("link", hand_frame);
-    approach->setProperty("group", arm_group);
-    approach->setMinMaxDistance(0.05, 0.15);
-
-    geometry_msgs::msg::Vector3Stamped direction;
-    direction.header.frame_id = hand_frame;
-    direction.vector.z = 1.0;
-    approach->setDirection(direction);
-    grasp->insert(std::move(approach));
-
-    // Pose gắp + IK
-    auto gen_pose = std::make_unique<mtc::stages::GenerateGraspPose>("generate grasp pose " + arm_prefix);
-    gen_pose->properties().set("marker_ns", "grasp_pose_" + arm_prefix);
-    gen_pose->setPreGraspPose("open");
-    gen_pose->setObject(object_name);
-    gen_pose->setAngleDelta(M_PI / 18.0);
-    gen_pose->setMonitoredStage(current_state_ptr);
-
-    Eigen::Isometry3d grasp_tf = Eigen::Isometry3d::Identity();
-    Eigen::Quaterniond q = Eigen::AngleAxisd(M_PI / 2.0, Eigen::Vector3d::UnitX()) *
-                           Eigen::AngleAxisd(M_PI / 2.0, Eigen::Vector3d::UnitY()) *
-                           Eigen::AngleAxisd(M_PI / 2.0, Eigen::Vector3d::UnitZ());
-    grasp_tf.linear() = q.matrix();
-    grasp_tf.translation().z() = 0.015;
-
-    auto ik_wrapper = std::make_unique<mtc::stages::ComputeIK>("grasp pose IK " + arm_prefix, std::move(gen_pose));
-    ik_wrapper->setMaxIKSolutions(8);
-    ik_wrapper->setMinSolutionDistance(0.1);
-    ik_wrapper->setIKFrame(grasp_tf, hand_frame);
-    ik_wrapper->setIgnoreCollisions(true);
-    ik_wrapper->setProperty("group", arm_group);
-    ik_wrapper->setProperty("eef", hand_group);
-    ik_wrapper->properties().configureInitFrom(mtc::Stage::INTERFACE, { "target_pose" });
-    grasp->insert(std::move(ik_wrapper));
-
-    // Đóng tay
-    auto close_hand = std::make_unique<mtc::stages::MoveTo>("close hand " + arm_prefix, interpolation_planner);
-    close_hand->setGroup(hand_group);
-    close_hand->setGoal("closed");
-    grasp->insert(std::move(close_hand));
-
-    // Gắn vật
-    auto attach = std::make_unique<mtc::stages::ModifyPlanningScene>("attach object " + arm_prefix);
-    attach->attachObject(object_name, hand_frame);
-    attach_stage = attach.get();
-    grasp->insert(std::move(attach));
-
-    // Nâng vật
-    auto lift = std::make_unique<mtc::stages::MoveRelative>("lift object " + arm_prefix, cartesian_planner);
-    lift->properties().set("marker_ns", "lift_" + arm_prefix);
-    lift->setProperty("group", arm_group);
-    lift->setMinMaxDistance(0.05, 0.15);
-    lift->setIKFrame(hand_frame);
-
-    geometry_msgs::msg::Vector3Stamped lift_direction;
-    lift_direction.header.frame_id = "world";
-    lift_direction.vector.z = 1.0;
-    lift->setDirection(lift_direction);
-    grasp->insert(std::move(lift));
-
-    task.add(std::move(grasp));
-  }
-
-  // 4. Di chuyển sang vị trí đặt
-  auto move_place = std::make_unique<mtc::stages::Connect>(
-      "move to place " + arm_prefix, mtc::stages::Connect::GroupPlannerVector{ { arm_group, sampling_planner } });
-  move_place->setTimeout(15.0);
-  move_place->properties().configureInitFrom(mtc::Stage::PARENT);
-  task.add(std::move(move_place));
-
-  // 5. Chuỗi Place
-  {
-    auto place = std::make_unique<mtc::SerialContainer>("place object " + arm_prefix);
-    place->setProperty("group", arm_group);
-    place->setProperty("eef", hand_group);
-    place->setProperty("ik_frame", hand_frame);
-
-    auto allow_table = std::make_unique<mtc::stages::ModifyPlanningScene>("allow collision table " + arm_prefix);
-    allow_table->allowCollisions(object_name, table_name, true);
-    allow_table->allowCollisions(table_name, hand_links, true);
-    place->insert(std::move(allow_table));
-
-    auto gen_place = std::make_unique<mtc::stages::GeneratePlacePose>("generate place pose " + arm_prefix);
-    gen_place->properties().set("marker_ns", "place_pose_" + arm_prefix);
-    gen_place->setObject(object_name);
-
-    geometry_msgs::msg::PoseStamped target_pose;
-    target_pose.header.frame_id = "world";
-    target_pose.pose.position.x = place_x;
-    target_pose.pose.position.y = 0.4;
-    target_pose.pose.position.z = 0.45;
-    target_pose.pose.orientation.w = 1.0;
-
-    gen_place->setPose(target_pose);
-    gen_place->setMonitoredStage(attach_stage);
-
-    auto ik_place = std::make_unique<mtc::stages::ComputeIK>("place pose IK " + arm_prefix, std::move(gen_place));
-    ik_place->setMaxIKSolutions(8);
-    ik_place->setMinSolutionDistance(0.1);
-    ik_place->setIKFrame(object_name);
-    ik_place->setIgnoreCollisions(true);
-    ik_place->setProperty("group", arm_group);
-    ik_place->setProperty("eef", hand_group);
-    ik_place->properties().configureInitFrom(mtc::Stage::INTERFACE, { "target_pose" });
-    place->insert(std::move(ik_place));
-
-    auto open_hand_post = std::make_unique<mtc::stages::MoveTo>("open hand post " + arm_prefix, interpolation_planner);
-    open_hand_post->setGroup(hand_group);
-    open_hand_post->setGoal("open");
-    place->insert(std::move(open_hand_post));
-
-    auto detach = std::make_unique<mtc::stages::ModifyPlanningScene>("detach object " + arm_prefix);
-    detach->detachObject(object_name, hand_frame);
-    place->insert(std::move(detach));
-
-    auto retreat = std::make_unique<mtc::stages::MoveRelative>("retreat " + arm_prefix, cartesian_planner);
-    retreat->properties().set("marker_ns", "retreat_" + arm_prefix);
-    retreat->setProperty("group", arm_group);
-    retreat->setMinMaxDistance(0.05, 0.15);
-    retreat->setIKFrame(hand_frame);
-
-    geometry_msgs::msg::Vector3Stamped retreat_direction;
-    retreat_direction.header.frame_id = "world";
-    retreat_direction.vector.z = 1.0;
-    retreat->setDirection(retreat_direction);
-    place->insert(std::move(retreat));
-
-    task.add(std::move(place));
-  }
-
-  // 6. Trở về vị trí Home
-  auto home = std::make_unique<mtc::stages::MoveTo>("return home " + arm_prefix, sampling_planner);
-  home->setProperty("group", arm_group);
-  home->setGoal(home_pose);
-  home->setTimeout(15.0);
-  task.add(std::move(home));
-}
-
-mtc::Task DualArmMTCTaskNode::createUnifiedDualArmTask()
-{
-  mtc::Task task;
-  task.stages()->setName("unified_dual_arm_task");
-  task.loadRobotModel(node_);
-
-  auto current_state = std::make_unique<mtc::stages::CurrentState>("current_state");
-  auto* current_state_ptr = current_state.get();
-  task.add(std::move(current_state));
-
-  auto sampling_planner = std::make_shared<mtc::solvers::PipelinePlanner>(node_);
-  sampling_planner->setProperty("planning_pipeline", "ompl");
-  sampling_planner->setPlannerId("RRTConnectkConfigDefault");
-
-  auto interpolation_planner = std::make_shared<mtc::solvers::JointInterpolationPlanner>();
-
-  auto cartesian_planner = std::make_shared<mtc::solvers::CartesianPath>();
-  cartesian_planner->setMaxVelocityScalingFactor(0.5);
-  cartesian_planner->setMaxAccelerationScalingFactor(0.5);
-  cartesian_planner->setStepSize(0.002);
-
-  // Thêm toàn bộ chuỗi Tay Trái
-  addArmPickPlaceSequence(task, current_state_ptr, "left", "left_object", 0.1, 
-                          sampling_planner, interpolation_planner, cartesian_planner);
-
-  // Thêm tiếp toàn bộ chuỗi Tay Phải vào chung 1 Task
-  addArmPickPlaceSequence(task, current_state_ptr, "right", "right_object", -0.1, 
-                          sampling_planner, interpolation_planner, cartesian_planner);
-
-  return task;
-}
-
-void DualArmMTCTaskNode::doTask()
-{
-  RCLCPP_INFO(LOGGER, "=== LẬP KẾ HOẠCH HỢP NHẤT CHO CẢ 2 TAY (SINGLE TASK) ===");
-  auto dual_task = createUnifiedDualArmTask();
-
-  try {
-    dual_task.init();
-  } catch (mtc::InitStageException& e) {
-    RCLCPP_ERROR_STREAM(LOGGER, "Lỗi Init MTC Task: " << e);
-    return;
-  }
-
-  if (dual_task.plan(5)) {
-    RCLCPP_INFO(LOGGER, "Lập kế hoạch thành công! Đang gửi quỹ đạo cho cả 2 tay...");
-    dual_task.introspection().publishSolution(*dual_task.solutions().front());
-    
-    auto result = dual_task.execute(*dual_task.solutions().front());
-    if (result.val == moveit_msgs::msg::MoveItErrorCodes::SUCCESS) {
-      RCLCPP_INFO(LOGGER, "=== CẢ 2 TAY ĐÃ HOÀN THÀNH QUY TRÌNH GẮP THẢ ===");
-    } else {
-      RCLCPP_ERROR(LOGGER, "Thực thi quỹ đạo thất bại!");
-    }
-  } else {
-    RCLCPP_ERROR(LOGGER, "Lập kế hoạch (Plan) cho cả 2 tay thất bại!");
-  }
-}
+}  // namespace ur_onrobot_mtc
 
 int main(int argc, char** argv)
 {
   rclcpp::init(argc, argv);
+
   rclcpp::NodeOptions options;
   options.automatically_declare_parameters_from_overrides(true);
 
-  auto dual_mtc_node = std::make_shared<DualArmMTCTaskNode>(options);
-  rclcpp::executors::MultiThreadedExecutor executor;
+  auto robot = std::make_shared<ur_onrobot_mtc::DualArmInterface>(options);
+  auto dispatcher = std::make_shared<ur_onrobot_mtc::CommandDispatcher>(robot);
 
-  auto spin_thread = std::make_unique<std::thread>([&executor, &dual_mtc_node]() {
-    executor.add_node(dual_mtc_node->getNodeBaseInterface());
+  rclcpp::executors::MultiThreadedExecutor executor;
+  executor.add_node(robot->getNodeBaseInterface());
+
+  std::thread spin_thread([&executor]() {
     executor.spin();
-    executor.remove_node(dual_mtc_node->getNodeBaseInterface());
   });
 
-  std::this_thread::sleep_for(std::chrono::seconds(2));
-  dual_mtc_node->doTask();
+  // Allow joint_states / move_group / PlanningScene to become available.
+  std::this_thread::sleep_for(std::chrono::seconds(1));
 
-  rclcpp::shutdown();
-  spin_thread->join();
+  if (!robot->initializeScene()) {
+    RCLCPP_ERROR(robot->node()->get_logger(),
+                 "Failed to initialize dual-arm scene");
+    rclcpp::shutdown();
+    spin_thread.join();
+    return 1;
+  }
+
+  dispatcher->printHelp();
+  RCLCPP_INFO(robot->node()->get_logger(),
+              "READY: run 'ros2 run ur_onrobot_mtc robot_cli' in another terminal");
+
+  spin_thread.join();
   return 0;
 }

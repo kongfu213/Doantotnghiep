@@ -1,0 +1,20 @@
+dual_arm_mtc_node:
+  ros__parameters:
+
+    mission_names:
+      - xep_thap
+      - xep_hinh_vuong
+
+    missions.xep_thap:
+      - "reset_scene"
+      - "stack_at -0.1 0.0 A C"
+      - "stack_at -0.1 0.0 B D"
+      - 'status'
+
+    missions.xep_hinh_vuong:
+      - "reset_scene"
+      - "move A 0.04 0.04 0.0175"
+      - "move B -0.04 0.04 0.0175"
+      - "move C 0.04 -0.04 0.0175"
+      - "move D -0.04 -0.04 0.0175"
+      - "status"
