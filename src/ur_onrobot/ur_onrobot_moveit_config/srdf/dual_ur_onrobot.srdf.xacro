@@ -7,7 +7,15 @@
     <!-- Gọi macro cho tay trái và tay phải -->
     <xacro:ur_onrobot_srdf name="ur_onrobot" prefix="left_" />
     <xacro:ur_onrobot_srdf name="ur_onrobot" prefix="right_" />
+    <group name="dual_arms">
+    <group name="left_ur_onrobot_manipulator"/>
+    <group name="right_ur_onrobot_manipulator"/>
+    </group>
 
+    <group name="dual_grippers">
+    <group name="left_ur_onrobot_gripper"/>
+    <group name="right_ur_onrobot_gripper"/>
+    </group>
     <!-- Tư thế tự định nghĩa cho TAY TRÁI -->
     <group_state name="left_scan_camera" group="left_ur_onrobot_manipulator">
         <joint name="left_elbow_joint" value="1.5" />

@@ -17,6 +17,7 @@
   <depend>moveit_task_constructor_visualization</depend>
   <depend>rclcpp</depend>
   <depend>shape_msgs</depend>
+  <depend>visualization_msgs</depend>
 
   <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>
