@@ -28,6 +28,7 @@ add_library(${PROJECT_NAME}_core
   src/tasks/move_task.cpp
   src/tasks/mission_task.cpp
   src/tasks/stack_task.cpp
+  src/tasks/solder_task.cpp
   src/tasks/swap_task.cpp
 )
 
@@ -68,6 +69,8 @@ ament_target_dependencies(dual_arm_mtc_node
 add_executable(setup_pcb_scene
   src/setup_pcb_scene.cpp
 )
+
+target_include_directories(setup_pcb_scene PRIVATE include)
 
 ament_target_dependencies(setup_pcb_scene
   rclcpp

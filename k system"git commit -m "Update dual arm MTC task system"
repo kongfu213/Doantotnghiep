@@ -1,0 +1,37 @@
+ .../ur_onrobot_mtc/CMakeLists.txt                  |  246 [32m+[m[31m-[m
+ .../ur_onrobot_mtc/config/missions.yaml            |   20 [32m+[m
+ .../include/ur_onrobot_mtc/dual_arm_interface.hpp  |   83 [32m+[m
+ .../include/ur_onrobot_mtc/tasks/mission_task.hpp  |   36 [32m+[m
+ .../include/ur_onrobot_mtc/tasks/move_task.hpp     |   25 [32m+[m
+ .../include/ur_onrobot_mtc/tasks/pick_task.hpp     |   25 [32m+[m
+ .../include/ur_onrobot_mtc/tasks/place_task.hpp    |   20 [32m+[m
+ .../ur_onrobot_mtc/tasks/robot_selector.hpp        |   27 [32m+[m
+ .../include/ur_onrobot_mtc/tasks/stack_task.hpp    |   21 [32m+[m
+ .../include/ur_onrobot_mtc/tasks/swap_task.hpp     |   19 [32m+[m
+ .../include/ur_onrobot_mtc/tasks/task_base.hpp     |   25 [32m+[m
+ .../ur_onrobot_mtc/tasks/task_dual_pick.hpp        |   31 [31m-[m
+ .../launch/dual_arm_controller.launch.py           |   33 [31m-[m
+ .../ur_onrobot_mtc/launch/pcb_scene.launch.py      |   27 [32m+[m
+ .../ur_onrobot_mtc/launch/right_mtc.launch.py      |  158 [31m-[m
+ ..._mtc.launch.py => run_dual_arms_test.launch.py} |  138 [32m+[m[31m-[m
+ .../ur_onrobot_mtc/launch/run_dual_mtc.launch.py   |  235 [32m+[m[31m-[m
+ .../launch/run_mtc_persistent_demo.launch.py       |  278 [32m+[m
+ .../ur_onrobot_mtc/launch/v1.txt                   |  216 [32m+[m
+ .../ur_onrobot_mtc/src/dual_arm_interface.cpp      | 6712 [32m++++++++++++++++++++[m
+ .../ur_onrobot_mtc/src/dual_arm_mtc_node.cpp       |  601 [32m+[m[31m-[m
+ .../ur_onrobot_mtc/src/dual_arms_12dof_test.cpp    |  969 [32m+++[m
+ .../ur_onrobot_mtc/src/left_arm_mtc_node.cpp       |  336 [31m-[m
+ .../ur_onrobot_mtc/src/mtc_persistent_demo.cpp     |  626 [32m++[m
+ .../ur_onrobot_mtc/src/right_arm_mtc_node.cpp      |  336 [31m-[m
+ .../ur_onrobot_mtc/src/robot_cli.cpp               |   56 [32m+[m
+ .../ur_onrobot_mtc/src/setup_pcb_scene.cpp         |  411 [32m++[m
+ .../ur_onrobot_mtc/src/tasks/mission_task.cpp      |  184 [32m+[m
+ .../ur_onrobot_mtc/src/tasks/move_task.cpp         |   38 [32m+[m
+ .../ur_onrobot_mtc/src/tasks/pick_task.cpp         |   41 [32m+[m
+ .../ur_onrobot_mtc/src/tasks/place_task.cpp        |   20 [32m+[m
+ .../ur_onrobot_mtc/src/tasks/robot_selector.cpp    |   74 [32m+[m
+ .../ur_onrobot_mtc/src/tasks/stack_task.cpp        |   26 [32m+[m
+ .../ur_onrobot_mtc/src/tasks/swap_task.cpp         |   19 [32m+[m
+ .../ur_onrobot_mtc/src/tasks/task_dual_pick.cpp    |  111 [31m-[m
+ .../ur_onrobot_mtc/src/v1.txt                      | 2926 [32m+++++++++[m
+ 36 files changed, 13518 insertions(+), 1631 deletions(-)

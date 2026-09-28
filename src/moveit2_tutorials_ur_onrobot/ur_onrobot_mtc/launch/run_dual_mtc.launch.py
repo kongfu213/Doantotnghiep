@@ -130,7 +130,12 @@ def launch_setup(context, *args, **kwargs):
         robot_description_planning,
         ompl_config,
         {"use_sim_time": use_sim_time},
-        {"execute": execute},
+        {"execute": ParameterValue(execute, value_type=bool)},
+        {"command_initialize_stack_scene": ParameterValue(
+            LaunchConfiguration("command_initialize_stack_scene"), value_type=bool)},
+        {"solder.holder_arm": LaunchConfiguration("holder_arm")},
+        {"solder.dwell_seconds": ParameterValue(LaunchConfiguration("dwell_seconds"), value_type=float)},
+        {"solder.approach_height": ParameterValue(LaunchConfiguration("approach_height"), value_type=float)},
         {"task_mode": task_mode},
         mission_parameters,
     ]
@@ -177,5 +182,9 @@ def generate_launch_description():
             ],
             description="command_server keeps the node alive and accepts /robot_command",
         ),
+        DeclareLaunchArgument("command_initialize_stack_scene", default_value="true", choices=["true", "false"]),
+        DeclareLaunchArgument("holder_arm", default_value="left", choices=["left", "right"]),
+        DeclareLaunchArgument("dwell_seconds", default_value="1.5"),
+        DeclareLaunchArgument("approach_height", default_value="0.06"),
         OpaqueFunction(function=launch_setup),
     ])

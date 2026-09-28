@@ -24,6 +24,7 @@ int main(int argc, char ** argv)
   std::cout << "  stack A B C D\n";
   std::cout << "  stack_at x y A B C D\n";
   std::cout << "  swap A B\n";
+  std::cout << "  solder [1|2|3|all]         # PCB simulation\n";
   std::cout << "  mission <name>\n";
   std::cout << "  missions                    # list available missions\n";
   std::cout << "  status\n";

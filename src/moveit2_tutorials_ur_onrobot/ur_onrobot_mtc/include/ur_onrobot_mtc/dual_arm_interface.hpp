@@ -5,6 +5,7 @@
 #include <vector>
 
 #include <rclcpp/rclcpp.hpp>
+#include <geometry_msgs/msg/pose.hpp>
 
 namespace ur_onrobot_mtc
 {
@@ -70,6 +71,11 @@ public:
   bool stack(const std::vector<std::string>& objects,
              double center_x, double center_y);
   bool swap(const std::string& object_a, const std::string& object_b);
+
+  // Read the rigid transform captured by PICK; shared by compound tasks.
+  bool heldObjectTransform(const std::string& object_name, ArmSide& arm,
+                           geometry_msgs::msg::Pose& hand_to_object) const;
+  bool releaseHeldObject(const std::string& object_name);
 
   static std::string normalizeObjectName(const std::string& name);
   static ArmSide parseArmSide(const std::string& text);

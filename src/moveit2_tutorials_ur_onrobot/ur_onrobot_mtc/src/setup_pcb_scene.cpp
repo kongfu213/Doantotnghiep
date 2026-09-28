@@ -1,4 +1,5 @@
 #include <rclcpp/rclcpp.hpp>
+#include "ur_onrobot_mtc/pcb_geometry.hpp"
 
 #include <geometry_msgs/msg/point.hpp>
 #include <geometry_msgs/msg/pose.hpp>
@@ -25,10 +26,15 @@ public:
   PcbSceneNode()
   : Node("setup_pcb_scene")
   {
+    show_tool_overlay_ = declare_parameter<bool>("show_tool_overlay", true);
+    prepare_table_ = declare_parameter<bool>("prepare_table", false);
     frame_id_ = declare_parameter<std::string>("frame_id", "world");
     table_top_ = declare_parameter<double>("table_top", -0.003);
     pcb_x_ = declare_parameter<double>("pcb_x", 0.0);
     pcb_y_ = declare_parameter<double>("pcb_y", 0.0);
+
+    // Raise PCB above the table for a more reachable soldering workspace.
+    pcb_lift_ = declare_parameter<double>("pcb_lift", 0.10);
 
     rclcpp::QoS marker_qos(1);
     marker_qos.reliable().transient_local();
@@ -61,6 +67,16 @@ private:
     return p;
   }
 
+  static geometry_msgs::msg::Pose makeVerticalToolPose(double x, double y, double z)
+  {
+    // Rotate the primitive's local +X axis onto the vertical Z axis.
+    // The box dimensions remain length/width/height, while its long axis is Z.
+    auto pose = makePose(x, y, z);
+    pose.orientation.w = 0.7071067811865476;
+    pose.orientation.y = 0.7071067811865476;
+    return pose;
+  }
+
   moveit_msgs::msg::CollisionObject makeBox(
       const std::string& id,
       double sx, double sy, double sz,
@@ -75,7 +91,8 @@ private:
     primitive.dimensions = {sx, sy, sz};
 
     object.primitives.push_back(primitive);
-    object.primitive_poses.push_back(makePose(x, y, z));
+    object.pose = makePose(x, y, z);
+    object.primitive_poses.push_back(makePose(0.0, 0.0, 0.0));
     object.operation = moveit_msgs::msg::CollisionObject::ADD;
     return object;
   }
@@ -96,33 +113,33 @@ private:
       primitive.type = shape_msgs::msg::SolidPrimitive::BOX;
       primitive.dimensions = {sx, sy, sz};
       object.primitives.push_back(primitive);
-      object.primitive_poses.push_back(makePose(x, py, z));
+      object.primitive_poses.push_back(makeVerticalToolPose(x, py, z));
     };
 
-    // Tool lies flat on the table and points toward +X / the PCB.
-    constexpr double handle_len = 0.100;
-    constexpr double handle_w = 0.026;
-    constexpr double handle_h = 0.024;
-    constexpr double shaft_len = 0.055;
-    constexpr double shaft_w = 0.009;
-    constexpr double shaft_h = 0.009;
-    constexpr double tip_len = 0.025;
-    constexpr double tip_w = 0.005;
-    constexpr double tip_h = 0.005;
+    // Tool stands vertically: handle above, tip down along -Z.
+    constexpr double handle_len = pcb::handle_length;
+    constexpr double handle_w = pcb::handle_width;
+    constexpr double handle_h = pcb::handle_height;
+    constexpr double shaft_len = pcb::shaft_length;
+    constexpr double shaft_w = pcb::shaft_width;
+    constexpr double shaft_h = pcb::shaft_width;
+    constexpr double tip_len = pcb::tip_length;
+    constexpr double tip_w = pcb::tip_width;
+    constexpr double tip_h = pcb::tip_width;
 
-    const double handle_right = handle_x + 0.5 * handle_len;
-    const double shaft_x = handle_right + 0.5 * shaft_len;
-    const double tip_x = handle_right + shaft_len + 0.5 * tip_len;
+    const double shaft_z = -(0.5 * handle_len + 0.5 * shaft_len);
+    const double tip_z = -(0.5 * handle_len + shaft_len + 0.5 * tip_len);
 
-    // Align all three parts along the handle centreline.
-    const double tool_center_z = table_top_ + 0.5 * handle_h;
+    // Keep the tip just above the table while the handle is upright.
+    const double tool_center_z = table_top_ + pcb::tip_from_handle + pcb::placement_clearance;
 
-    add_box(handle_len, handle_w, handle_h,
-            handle_x, y, tool_center_z);
+    // Object frame is the handle centre: PICK and tip targeting use this pose.
+    object.pose = makePose(handle_x, y, tool_center_z);
+    add_box(handle_len, handle_w, handle_h, 0.0, 0.0, 0.0);
     add_box(shaft_len, shaft_w, shaft_h,
-            shaft_x, y, tool_center_z);
+            0.0, 0.0, shaft_z);
     add_box(tip_len, tip_w, tip_h,
-            tip_x, y, tool_center_z);
+            0.0, 0.0, tip_z);
 
     return object;
   }
@@ -234,21 +251,43 @@ private:
   {
     // ---------------- Physical collision geometry ----------------
     // V3: slightly larger PCB, smaller components, only 3 components.
-    constexpr double pcb_sx = 0.220;   // 220 mm
-    constexpr double pcb_sy = 0.150;   // 150 mm
-    constexpr double pcb_sz = 0.005;   // 5 mm
+    constexpr double pcb_sx = pcb::board_x;   // 220 mm
+    constexpr double pcb_sy = pcb::board_y;   // 150 mm
+    constexpr double pcb_sz = pcb::board_z;   // 5 mm
 
-    constexpr double component_sx = 0.012;  // 12 mm
-    constexpr double component_sy = 0.022;  // 22 mm
-    constexpr double component_sz = 0.014;  // 14 mm
+    constexpr double component_sx = pcb::component_x;  // 12 mm
+    constexpr double component_sy = pcb::component_y;  // 22 mm
+    constexpr double component_sz = pcb::component_z;  // 14 mm
 
-    const double pcb_center_z = table_top_ + 0.5 * pcb_sz;
-    const double pcb_top_z = table_top_ + pcb_sz;
-    const double component_source_z = table_top_ + 0.5 * component_sz;
-    const double component_target_z = pcb_top_z + 0.5 * component_sz;
+    // Raise the complete PCB work surface.
+    const double pcb_base_z = table_top_ + pcb_lift_;
+    const double pcb_center_z = pcb_base_z + 0.5 * pcb_sz;
+    const double pcb_top_z = pcb_base_z + pcb_sz;
+
+    // Source components remain on the table.
+    const double component_source_z =
+        table_top_ + 0.5 * component_sz + pcb::placement_clearance;
+
+    // Placement target follows the lifted PCB.
+    const double component_target_z =
+        pcb_top_z + 0.5 * component_sz + pcb::placement_clearance;
 
     std::vector<moveit_msgs::msg::CollisionObject> objects;
-    objects.reserve(5);
+    objects.reserve(10);
+    if (!planning_scene_interface_.getAttachedObjects().empty()) {
+      RCLCPP_ERROR(get_logger(), "Refusing to respawn PCB while an object is attached");
+      return;
+    }
+    if (prepare_table_) {
+      objects.push_back(makeBox("table", 1.0, 1.0, 0.10,
+                               0.0, 0.0, table_top_ - 0.05));
+      for (const auto* id : {"stack_A", "stack_B", "stack_C", "stack_D"}) {
+        moveit_msgs::msg::CollisionObject old;
+        old.header.frame_id = frame_id_; old.id = id;
+        old.operation = moveit_msgs::msg::CollisionObject::REMOVE;
+        objects.push_back(old);
+      }
+    }
 
     // Keep collision fast and stable: PCB remains one flat collision box.
     objects.push_back(makeBox(
@@ -279,16 +318,12 @@ private:
 
     // ---------------- Visual-only PCB details ----------------
     // Slot centres are target coordinates, not extra collision objects.
-    const std::array<std::array<double, 2>, 3> slots = {{
-      {{-0.055,  0.032}},
-      {{ 0.055,  0.032}},
-      {{ 0.000, -0.035}}
-    }};
+    const auto& slots = pcb::slots;
 
-    constexpr double pad_dx = 0.011;
-    constexpr double pad_sx = 0.006;
-    constexpr double pad_sy = 0.005;
-    constexpr double pad_sz = 0.0008;
+    constexpr double pad_dx = pcb::pad_dx;
+    constexpr double pad_sx = pcb::pad_x;
+    constexpr double pad_sy = pcb::pad_y;
+    constexpr double pad_sz = pcb::pad_z;
 
     // Visual recess around each component position.
     // It is intentionally visual-only so it does not make placement collide with the PCB box.
@@ -299,7 +334,7 @@ private:
     constexpr double recess_lip_w = 0.0020;
 
     const double visual_z = pcb_top_z + 0.0012;
-    const double pad_z = pcb_top_z + 0.0015;
+    const double pad_z = pcb_top_z + pcb::pad_center_above_board;
     const double recess_plate_z = pcb_top_z + 0.00030;
     const double recess_lip_z = pcb_top_z + 0.5 * recess_lip_h;
 
@@ -482,40 +517,54 @@ private:
         0.006, 0.006, 0.001,
         0.95f, 0.95f, 0.95f));
 
-    // Visual colouring for the soldering iron. Collision object remains solder_tool.
-    const double tool_center_z = table_top_ + 0.012;  // Match collision handle centre.
-    constexpr double handle_len = 0.100;
-    constexpr double shaft_len = 0.055;
-    constexpr double tip_len = 0.025;
-    const double handle_right = solder_handle_x + 0.5 * handle_len;
-    const double shaft_x = handle_right + 0.5 * shaft_len;
-    const double tip_x = handle_right + shaft_len + 0.5 * tip_len;
+    if (show_tool_overlay_) {
+    // Visual colouring for the upright soldering iron. Collision object remains solder_tool.
+    const double tool_center_z = table_top_ + pcb::tip_from_handle + pcb::placement_clearance;
+    constexpr double handle_len = pcb::handle_length;
+    constexpr double handle_w = pcb::handle_width;
+    constexpr double handle_h = pcb::handle_height;
+    constexpr double shaft_len = pcb::shaft_length;
+    constexpr double shaft_w = pcb::shaft_width;
+    constexpr double shaft_h = pcb::shaft_width;
+    constexpr double tip_len = pcb::tip_length;
+    constexpr double tip_w = pcb::tip_width;
+    constexpr double tip_h = pcb::tip_width;
+    const double shaft_z = tool_center_z - 0.5 * handle_len - 0.5 * shaft_len;
+    const double tip_z = tool_center_z - 0.5 * handle_len - shaft_len - 0.5 * tip_len;
 
     markers.markers.push_back(makeCubeMarker(
         marker_id++, "solder_tool_visual",
         solder_handle_x, solder_y, tool_center_z,
-        0.100, 0.026, 0.024,
+        handle_h, handle_w, handle_len,
         0.08f, 0.12f, 0.16f));
     markers.markers.push_back(makeCubeMarker(
         marker_id++, "solder_tool_visual",
-        shaft_x, solder_y, tool_center_z,
-        0.055, 0.009, 0.009,
+        solder_handle_x, solder_y, shaft_z,
+        shaft_h, shaft_w, shaft_len,
         0.55f, 0.55f, 0.58f));
     markers.markers.push_back(makeCubeMarker(
         marker_id++, "solder_tool_visual",
-        tip_x, solder_y, tool_center_z,
-        0.025, 0.005, 0.005,
+        solder_handle_x, solder_y, tip_z,
+        tip_h, tip_w, tip_len,
         0.28f, 0.28f, 0.30f));
     markers.markers.push_back(makeTextMarker(
         marker_id++, "solder_tool_label", "SOLDER TOOL",
-        solder_handle_x, solder_y - 0.025, table_top_ + 0.025,
+        solder_handle_x, solder_y - 0.025, table_top_ + 0.015,
         0.008, 0.95f, 0.95f, 0.95f));
 
+    }
+    // Clear stale decorative markers from an earlier static-scene run.
+    visualization_msgs::msg::Marker clear;
+    clear.action = visualization_msgs::msg::Marker::DELETEALL;
+    markers.markers.insert(markers.markers.begin(), clear);
     marker_pub_->publish(markers);
 
     RCLCPP_INFO(get_logger(), "==========================================");
     RCLCPP_INFO(get_logger(), " PCB SOLDER SCENE V3 READY");
     RCLCPP_INFO(get_logger(), " PCB: 220 x 150 x 5 mm");
+    RCLCPP_INFO(get_logger(), " PCB lift above table: %.3f m", pcb_lift_);
+    RCLCPP_INFO(get_logger(), " PCB bottom Z: %.4f m", pcb_base_z);
+    RCLCPP_INFO(get_logger(), " PCB top Z: %.4f m", pcb_top_z);
     RCLCPP_INFO(get_logger(), " Components: 3 x (12 x 22 x 14 mm)");
     RCLCPP_INFO(get_logger(), " Collision: PCB + 3 movable components + solder_tool");
     RCLCPP_INFO(get_logger(), " Visual: recessed-looking slots, pads, traces, vias, labels");
@@ -524,10 +573,13 @@ private:
     RCLCPP_INFO(get_logger(), "==========================================");
   }
 
+  bool show_tool_overlay_{true};
+  bool prepare_table_{false};
   std::string frame_id_;
   double table_top_{-0.003};
   double pcb_x_{0.0};
   double pcb_y_{0.0};
+  double pcb_lift_{0.10};
 
   moveit::planning_interface::PlanningSceneInterface planning_scene_interface_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr marker_pub_;

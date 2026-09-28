@@ -21,6 +21,7 @@
 #include "ur_onrobot_mtc/tasks/robot_selector.hpp"
 #include "ur_onrobot_mtc/tasks/stack_task.hpp"
 #include "ur_onrobot_mtc/tasks/swap_task.hpp"
+#include "ur_onrobot_mtc/tasks/solder_task.hpp"
 
 namespace ur_onrobot_mtc
 {
@@ -31,6 +32,7 @@ public:
   explicit CommandDispatcher(std::shared_ptr<DualArmInterface> robot)
     : robot_(std::move(robot))
   {
+    solder_task_ = std::make_shared<SolderTask>(robot_);
     selector_ = std::make_shared<RobotSelector>(robot_);
     pick_task_ = std::make_shared<PickTask>(robot_, selector_);
     place_task_ = std::make_shared<PlaceTask>(robot_);
@@ -81,6 +83,7 @@ public:
     RCLCPP_INFO(logger, " stack A B C D        # dual-pick in pairs, stack at first object x/y");
     RCLCPP_INFO(logger, " stack_at x y A B C D # dual-pick in pairs, explicit stack target");
     RCLCPP_INFO(logger, " swap A B");
+    RCLCPP_INFO(logger, " solder [1|2|3|all]       # hold component and solder both pads");
     RCLCPP_INFO(logger, " mission <name>           # run a predefined mission");
     RCLCPP_INFO(logger, " missions                 # list predefined missions");
     RCLCPP_INFO(logger, " status");
@@ -149,8 +152,23 @@ private:
       return true;
     }
 
-    if (op == "reset_scene")
+    if (op == "reset_scene") {
+      if (!robot_->node()->get_parameter("command_initialize_stack_scene").as_bool()) {
+        RCLCPP_ERROR(robot_->node()->get_logger(), "PCB mode: restart the simulation to reset the scene");
+        return false;
+      }
       return robot_->resetScene();
+    }
+
+    if (op == "solder") {
+      std::string selection = "all", extra;
+      ss >> selection;
+      if ((ss >> extra) || (selection != "all" && selection != "1" && selection != "2" && selection != "3")) {
+        RCLCPP_ERROR(robot_->node()->get_logger(), "Usage: solder [1|2|3|all]");
+        return false;
+      }
+      return solder_task_->execute(selection == "all" ? 0 : selection[0] - '0');
+    }
 
     if (op == "missions") {
       mission_task_->printAvailable();
@@ -311,6 +329,7 @@ private:
   std::shared_ptr<MoveTask> move_task_;
   std::shared_ptr<StackTask> stack_task_;
   std::shared_ptr<SwapTask> swap_task_;
+  std::shared_ptr<SolderTask> solder_task_;
   std::shared_ptr<MissionTask> mission_task_;
 
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr command_sub_;

@@ -1503,7 +1503,7 @@ private:
     for (const auto& kv : objects) {
       if (kv.first == "table" || kv.second.primitive_poses.empty())
         continue;
-      const auto& p = kv.second.primitive_poses.front();
+      const auto& p = kv.second.pose;
       RCLCPP_INFO(LOGGER, "WORLD %-12s (%.3f, %.3f, %.3f)",
                   kv.first.c_str(), p.position.x, p.position.y, p.position.z);
     }
@@ -6579,6 +6579,41 @@ public:
     return swapObjects(normalizeObjectName(object_a), normalizeObjectName(object_b));
   }
 
+  bool apiHeldObjectTransform(const std::string& name, ArmSide& arm,
+                              geometry_msgs::msg::Pose& pose) const
+  {
+    arm = holdingArm(name);
+    if (arm == ArmSide::NONE) return false;
+    const auto& tf = heldForArm(arm).hand_to_object;
+    const Eigen::Quaterniond q(tf.linear());
+    pose.position.x = tf.translation().x();
+    pose.position.y = tf.translation().y();
+    pose.position.z = tf.translation().z();
+    pose.orientation.x = q.x(); pose.orientation.y = q.y();
+    pose.orientation.z = q.z(); pose.orientation.w = q.w();
+    return true;
+  }
+
+  bool apiReleaseHeldObject(const std::string& name)
+  {
+    const ArmSide arm = holdingArm(name);
+    if (arm == ArmSide::NONE || !apiExecuteEnabled()) return false;
+    if (!executeOneGripper(arm == ArmSide::LEFT, 0.100, "RELEASE " + name))
+      return false;
+    moveit::planning_interface::MoveGroupInterface group(node_, armConfig(arm, name).arm_group);
+    if (!group.detachObject(name)) return false;
+    moveit::planning_interface::PlanningSceneInterface psi;
+    for (int i = 0; i < 20; ++i) {
+      if (psi.getAttachedObjects({name}).empty() && psi.getObjects({name}).count(name)) {
+        heldForArm(arm) = HeldObject{};
+        return true;
+      }
+      rclcpp::sleep_for(std::chrono::milliseconds(100));
+    }
+    RCLCPP_ERROR(LOGGER, "Release of %s not confirmed; inspect scene before retry", name.c_str());
+    return false;
+  }
+
   double stack_table_top_ = -0.003;
   double stack_column_yaw_ = std::numeric_limits<double>::quiet_NaN();
 
@@ -6680,6 +6715,17 @@ bool DualArmInterface::stack(const std::vector<std::string>& objects,
 bool DualArmInterface::swap(const std::string& object_a, const std::string& object_b)
 {
   return impl_->apiSwap(object_a, object_b);
+}
+
+bool DualArmInterface::heldObjectTransform(const std::string& object_name, ArmSide& arm,
+                                          geometry_msgs::msg::Pose& hand_to_object) const
+{
+  return impl_->apiHeldObjectTransform(object_name, arm, hand_to_object);
+}
+
+bool DualArmInterface::releaseHeldObject(const std::string& object_name)
+{
+  return impl_->apiReleaseHeldObject(object_name);
 }
 
 std::string DualArmInterface::normalizeObjectName(const std::string& name)
