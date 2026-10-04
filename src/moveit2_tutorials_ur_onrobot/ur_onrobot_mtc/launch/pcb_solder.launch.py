@@ -19,6 +19,7 @@ def generate_launch_description():
         DeclareLaunchArgument("pcb_x", default_value="0.0"),
         DeclareLaunchArgument("pcb_y", default_value="0.0"),
         DeclareLaunchArgument("table_top", default_value="-0.003"),
+        DeclareLaunchArgument("pcb_lift", default_value="0.10"),
         DeclareLaunchArgument("use_sim_time", default_value="false"),
     ]
 
@@ -34,7 +35,7 @@ def generate_launch_description():
                     LaunchConfiguration(name),
                     value_type=float
                 )
-                for name in ("pcb_x", "pcb_y", "table_top")
+                for name in ("pcb_x", "pcb_y", "table_top", "pcb_lift")
             },
             "use_sim_time": ParameterValue(
                 LaunchConfiguration("use_sim_time"),

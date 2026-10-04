@@ -5,6 +5,8 @@
 #include <geometry_msgs/msg/pose.hpp>
 #include <moveit/planning_scene_interface/planning_scene_interface.h>
 #include <moveit_msgs/msg/collision_object.hpp>
+#include <moveit_msgs/msg/object_color.hpp>
+#include <moveit_msgs/msg/planning_scene.hpp>
 #include <shape_msgs/msg/solid_primitive.hpp>
 #include <visualization_msgs/msg/marker.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
@@ -13,6 +15,7 @@
 #include <chrono>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace std::chrono_literals;
@@ -300,10 +303,31 @@ private:
     const std::array<double, 3> source_y = {-0.055, 0.000, 0.055};
 
     for (std::size_t i = 0; i < source_y.size(); ++i) {
-      objects.push_back(makeBox(
-          "component_" + std::to_string(i + 1),
-          component_sx, component_sy, component_sz,
-          source_x, source_y[i], component_source_z));
+      const std::string id = "component_" + std::to_string(i + 1);
+
+      if (i == 2) {
+        // Component 3 is a short cylinder with a circular face.
+        moveit_msgs::msg::CollisionObject cylinder;
+        cylinder.header.frame_id = frame_id_;
+        cylinder.id = id;
+
+        shape_msgs::msg::SolidPrimitive primitive;
+        primitive.type = shape_msgs::msg::SolidPrimitive::CYLINDER;
+        primitive.dimensions = {component_sz, component_y / 2.0};
+
+        cylinder.primitives.push_back(primitive);
+        cylinder.pose = makePose(
+            source_x, source_y[i], component_source_z);
+        cylinder.primitive_poses.push_back(makePose(0.0, 0.0, 0.0));
+        cylinder.operation = moveit_msgs::msg::CollisionObject::ADD;
+        objects.push_back(cylinder);
+      } else {
+        // Components 1 and 2 remain rectangular boxes.
+        objects.push_back(makeBox(
+            id,
+            component_sx, component_sy, component_sz,
+            source_x, source_y[i], component_source_z));
+      }
     }
 
     // Soldering iron lies on the table on the -X side, ready for the solder arm.
@@ -314,6 +338,27 @@ private:
     if (!planning_scene_interface_.applyCollisionObjects(objects)) {
       RCLCPP_ERROR(get_logger(), "Failed to apply PCB scene collision objects");
       return;
+    }
+
+    // Apply the component colours to the actual MoveIt collision objects too.
+    // This lets RViz's MoveIt PlanningScene display show the colours without
+    // relying only on the separate MarkerArray overlay below.
+    moveit_msgs::msg::PlanningScene color_scene;
+    color_scene.is_diff = true;
+    for (const auto& [id, rgb] : std::array<std::pair<std::string, std::array<float, 3>>, 3>{{
+           {"component_1", {0.0f, 0.45f, 0.95f}},
+           {"component_2", {0.0f, 0.45f, 0.95f}},
+           {"component_3", {0.95f, 0.05f, 0.05f}}}}) {
+      moveit_msgs::msg::ObjectColor color;
+      color.id = id;
+      color.color.r = rgb[0];
+      color.color.g = rgb[1];
+      color.color.b = rgb[2];
+      color.color.a = 1.0f;
+      color_scene.object_colors.push_back(color);
+    }
+    if (!planning_scene_interface_.applyPlanningScene(color_scene)) {
+      RCLCPP_WARN(get_logger(), "Failed to apply component colours to MoveIt planning scene");
     }
 
     // ---------------- Visual-only PCB details ----------------
@@ -340,6 +385,39 @@ private:
 
     visualization_msgs::msg::MarkerArray markers;
     int marker_id = 0;
+
+    // Coloured visual overlays for the source components. These markers are
+    // slightly larger than the collision shapes so they remain clearly visible
+    // in RViz without changing MoveIt's collision geometry.
+    for (std::size_t i = 0; i < source_y.size(); ++i) {
+      const int id = marker_id++;
+      if (i == 2) {
+        visualization_msgs::msg::Marker cylinder;
+        cylinder.header.frame_id = frame_id_;
+        cylinder.header.stamp = now();
+        cylinder.ns = "component_visuals";
+        cylinder.id = id;
+        cylinder.type = visualization_msgs::msg::Marker::CYLINDER;
+        cylinder.action = visualization_msgs::msg::Marker::ADD;
+        cylinder.pose = makePose(source_x, source_y[i], component_source_z);
+        cylinder.scale.x = component_y + 0.0002;
+        cylinder.scale.y = component_y + 0.0002;
+        cylinder.scale.z = component_sz + 0.0002;
+        cylinder.color.r = 0.95f;
+        cylinder.color.g = 0.05f;
+        cylinder.color.b = 0.05f;
+        cylinder.color.a = 1.0f;
+        cylinder.lifetime = rclcpp::Duration::from_seconds(0.0);
+        markers.markers.push_back(cylinder);
+      } else {
+        markers.markers.push_back(makeCubeMarker(
+            id, "component_visuals",
+            source_x, source_y[i], component_source_z,
+            component_sx + 0.0002, component_sy + 0.0002,
+            component_sz + 0.0002,
+            0.0f, 0.45f, 0.95f));
+      }
+    }
 
     // PCB outer silkscreen border.
     {
@@ -565,7 +643,8 @@ private:
     RCLCPP_INFO(get_logger(), " PCB lift above table: %.3f m", pcb_lift_);
     RCLCPP_INFO(get_logger(), " PCB bottom Z: %.4f m", pcb_base_z);
     RCLCPP_INFO(get_logger(), " PCB top Z: %.4f m", pcb_top_z);
-    RCLCPP_INFO(get_logger(), " Components: 3 x (12 x 22 x 14 mm)");
+    RCLCPP_INFO(get_logger(), " Components 1-2: BOX 12 x 22 x 14 mm (sea blue)");
+    RCLCPP_INFO(get_logger(), " Component 3: CYLINDER diameter 22 mm x height 14 mm (red)");
     RCLCPP_INFO(get_logger(), " Collision: PCB + 3 movable components + solder_tool");
     RCLCPP_INFO(get_logger(), " Visual: recessed-looking slots, pads, traces, vias, labels");
     RCLCPP_INFO(get_logger(), " Marker topic: /pcb_scene_markers");

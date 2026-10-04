@@ -55,7 +55,7 @@
     </group_state>
 
     <group_state name="tha_vat" group="right_ur_onrobot_manipulator">
-        <joint name="right_shoulder_pan_joint" value="3.2289"/>
+        <joint name="right_shoulder_pan_joint" value="-1.8500"/>
         <joint name="right_shoulder_lift_joint" value="-0.2269"/>
         <joint name="right_elbow_joint" value="-0.3142"/>
         <joint name="right_wrist_1_joint" value="-1.0297"/>
