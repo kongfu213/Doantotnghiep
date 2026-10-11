@@ -313,7 +313,9 @@ private:
 
         shape_msgs::msg::SolidPrimitive primitive;
         primitive.type = shape_msgs::msg::SolidPrimitive::CYLINDER;
-        primitive.dimensions = {component_sz, component_y / 2.0};
+        primitive.dimensions.clear();
+        primitive.dimensions.push_back(component_sz);
+        primitive.dimensions.push_back(pcb::component_y / 2.0);
 
         cylinder.primitives.push_back(primitive);
         cylinder.pose = makePose(
@@ -400,8 +402,8 @@ private:
         cylinder.type = visualization_msgs::msg::Marker::CYLINDER;
         cylinder.action = visualization_msgs::msg::Marker::ADD;
         cylinder.pose = makePose(source_x, source_y[i], component_source_z);
-        cylinder.scale.x = component_y + 0.0002;
-        cylinder.scale.y = component_y + 0.0002;
+        cylinder.scale.x = pcb::component_y + 0.0002;
+        cylinder.scale.y = pcb::component_y + 0.0002;
         cylinder.scale.z = component_sz + 0.0002;
         cylinder.color.r = 0.95f;
         cylinder.color.g = 0.05f;

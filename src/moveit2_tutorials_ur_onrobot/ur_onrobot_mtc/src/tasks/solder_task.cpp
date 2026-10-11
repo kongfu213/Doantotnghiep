@@ -189,7 +189,11 @@ public:
       for (int i : selected) {
 
         if (completed_.count(i)) throw std::runtime_error("Component already soldered in this session");
-        requireBox("component_" + std::to_string(i), 0, {pcb::component_x, pcb::component_y, pcb::component_z});
+        const std::string component_id = "component_" + std::to_string(i);
+        if (i == 3)
+          requireCylinder(component_id, pcb::component_z, pcb::component_y / 2.0);
+        else
+          requireBox(component_id, 0, {pcb::component_x, pcb::component_y, pcb::component_z});
       }
 
       GraspContacts tool_contacts(node_);
@@ -245,35 +249,34 @@ public:
         if (!robot_->releaseHeldObject(object)) throw std::runtime_error("Component release failed");
         status("RETREAT_HOLDER " + std::to_string(i));
         cartesian(holder_group, above * hand_to_component.inverse());
-        // Raise the empty holder first, then move it sideways off the PCB.
-        // A single pose goal 20 cm sideways and 12 cm upward inherited the
-        // placement quaternion and was outside the arm's solvable IK region.
-        // Try short Cartesian segments first; after release, position-only
-        // planning can change the empty gripper's orientation if needed.
+        // Raise the empty holder first. For the left component arm, plan from
+        // this clear pose directly to the SRDF home pose instead of targeting
+        // an intermediate Cartesian park point that may be outside its reach.
         Transform holder_park = above * hand_to_component.inverse();
         Transform holder_park_high = holder_park;
         holder_park_high.translation() += board.linear().col(2) * 0.05;
         status("PARK_HOLDER_RAISE " + std::to_string(i));
         cartesianOrPlan(holder_group, holder_park_high, "PARK_HOLDER_RAISE");
 
-        const double board_side = holder == ArmSide::LEFT ? 1.0 : -1.0;
-        holder_park = holder_park_high;
-        holder_park.translation() += board.linear().col(1) * (board_side * 0.17);
-        RCLCPP_INFO(node_->get_logger(),
-                    "SOLDER holder park TCP=(%.4f %.4f %.4f)",
-                    holder_park.translation().x(), holder_park.translation().y(),
-                    holder_park.translation().z());
-        status("PARK_HOLDER " + std::to_string(i));
-        // The lateral park move does not need a straight-line path. If the
-        // Cartesian interpolation fails, the fallback keeps this position
-        // goal but lets the empty gripper choose a reachable orientation.
-        // Pad contact and retreat retain strict Cartesian checks.
-        cartesianOrPlan(holder_group, holder_park, "PARK_HOLDER");
-        status("HOLDER_CLEAR " + std::to_string(i));
-        // Keep only the gripper/component contact allowance while the released
-        // part is still near the fingers; restore the normal collision rules
-        // once the holder has cleared the PCB.
+        // The component is released and the gripper has risen clear of it;
+        // restore normal collision rules before planning the return move.
         component_contacts.restore();
+
+        if (holder == ArmSide::LEFT) {
+          status("HOME_LEFT_AFTER_RELEASE " + std::to_string(i));
+          moveNamedTarget(holder_group, "left_home", "after component release");
+        } else {
+          const double board_side = -1.0;
+          holder_park = holder_park_high;
+          holder_park.translation() += board.linear().col(1) * (board_side * 0.17);
+          RCLCPP_INFO(node_->get_logger(),
+                      "SOLDER holder park TCP=(%.4f %.4f %.4f)",
+                      holder_park.translation().x(), holder_park.translation().y(),
+                      holder_park.translation().z());
+          status("PARK_HOLDER " + std::to_string(i));
+          cartesianOrPlan(holder_group, holder_park, "PARK_HOLDER");
+        }
+        status("HOLDER_CLEAR " + std::to_string(i));
 
         for (std::size_t pad = 0; pad < 2; ++pad) {
           solderPad(tool_group, board, hand_to_tip, i, pad, solderer);
@@ -282,9 +285,11 @@ public:
         completed_.insert(i);
         // Return the soldering arm to its clear standby pose, then move the
         // component arm to its configured wait pose for the next pick.
-        status("RESET_HOLDER_READY " + std::to_string(i));
         move(tool_group, tool_standby * hand_to_tool.inverse());
-        moveJointTarget(holder_group, holder_ready_positions, "next component pick");
+        if (i != selected.back()) {
+          status("RESET_HOLDER_READY " + std::to_string(i));
+          moveJointTarget(holder_group, holder_ready_positions, "next component pick");
+        }
       }
 
       status("RETURN_TOOL");
@@ -338,6 +343,20 @@ private:
     for (std::size_t j = 0; j < 3; ++j)
       if (std::abs(primitives[index].dimensions[j] - size[j]) > 1e-6)
         throw std::runtime_error("Scene dimensions differ from shared PCB geometry: " + id);
+  }
+
+  void requireCylinder(const std::string& id, double height, double radius)
+  {
+    const auto objects = scene_.getObjects({id});
+    if (!objects.count(id)) throw std::runtime_error("Run pcb_solder.launch.py first: missing " + id);
+    const auto& primitives = objects.at(id).primitives;
+    if (primitives.size() != 1 ||
+        primitives[0].type != shape_msgs::msg::SolidPrimitive::CYLINDER ||
+        primitives[0].dimensions.size() != 2)
+      throw std::runtime_error("Expected cylinder collision geometry: " + id);
+    if (std::abs(primitives[0].dimensions[shape_msgs::msg::SolidPrimitive::CYLINDER_HEIGHT] - height) > 1e-6 ||
+        std::abs(primitives[0].dimensions[shape_msgs::msg::SolidPrimitive::CYLINDER_RADIUS] - radius) > 1e-6)
+      throw std::runtime_error("Scene dimensions differ from shared PCB geometry: " + id);
   }
 
 
@@ -519,6 +538,21 @@ private:
     group.clearPoseTargets();
     if (code != moveit::core::MoveItErrorCode::SUCCESS)
       throw std::runtime_error("No collision-free ready posture for " + label +
+                               " code=" + std::to_string(code.val));
+    run(group, result);
+  }
+
+  void moveNamedTarget(Group& group, const std::string& target, const std::string& label)
+  {
+    group.setStartStateToCurrentState();
+    group.clearPoseTargets();
+    if (!group.setNamedTarget(target))
+      throw std::runtime_error("Cannot set named target " + target + " for " + label);
+    Group::Plan result;
+    const auto code = group.plan(result);
+    group.clearPoseTargets();
+    if (code != moveit::core::MoveItErrorCode::SUCCESS)
+      throw std::runtime_error("No collision-free named target " + target + " for " + label +
                                " code=" + std::to_string(code.val));
     run(group, result);
   }
