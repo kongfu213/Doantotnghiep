@@ -17,7 +17,7 @@ inline constexpr double pad_dx = 0.011, pad_x = 0.006, pad_y = 0.005, pad_z = 0.
 inline constexpr double pad_center_above_board = 0.0015;
 inline constexpr double placement_clearance = 0.0005;
 inline constexpr std::array<std::array<double, 2>, 3> slots = {{
-  {{-0.055, 0.032}}, {{0.055, 0.032}}, {{0.000, -0.035}}
+  {{-0.055, 0.032}}, {{0.055, 0.032}}, {{0.000, 0.000}}
 }};
 
 inline std::array<double, 3> componentOffset(std::size_t slot)

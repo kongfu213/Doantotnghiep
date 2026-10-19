@@ -1,6 +1,9 @@
 #include "ur_onrobot_mtc/tasks/solder_task.hpp"
 #include "ur_onrobot_mtc/pcb_geometry.hpp"
 
+// RRTConnect plans free-space transfers; Cartesian interpolation follows each
+// derived rectangular pad edge and performs the contact/descent stroke.
+
 #include <Eigen/Geometry>
 #include <moveit/move_group_interface/move_group_interface.h>
 #include <moveit/planning_scene_interface/planning_scene_interface.h>
@@ -11,6 +14,8 @@
 #include <moveit/trajectory_processing/iterative_time_parameterization.h>
 #include <moveit_msgs/srv/get_planning_scene.hpp>
 #include <moveit_msgs/msg/planning_scene_components.hpp>
+#include <moveit_msgs/msg/planner_interface_description.hpp>
+#include <geometry_msgs/msg/point.hpp>
 #include <shape_msgs/msg/solid_primitive.hpp>
 #include <std_msgs/msg/string.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
@@ -18,10 +23,12 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cctype>
 #include <cmath>
 #include <future>
 #include <map>
 #include <set>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <utility>
@@ -138,6 +145,13 @@ public:
     if (!node_->has_parameter("solder.holder_arm")) node_->declare_parameter<std::string>("solder.holder_arm", "left");
     if (!node_->has_parameter("solder.dwell_seconds")) node_->declare_parameter<double>("solder.dwell_seconds", 1.5);
     if (!node_->has_parameter("solder.approach_height")) node_->declare_parameter<double>("solder.approach_height", 0.06);
+    if (!node_->has_parameter("solder.planner_timeout_seconds"))
+      node_->declare_parameter<double>("solder.planner_timeout_seconds", 1.5);
+    // Use this only if MoveIt cannot provide its runtime planner catalog.
+    // When the catalog is available, refreshPlannerCatalog() selects the
+    // advertised RRTConnect ID or the pipeline default.
+    planner_trials_ = {"move_group:RRTConnectkConfigDefault"};
+    planner_timeout_seconds_ = node_->get_parameter("solder.planner_timeout_seconds").as_double();
     status_pub_ = node_->create_publisher<std_msgs::msg::String>("/solder_status", rclcpp::QoS(1).transient_local());
     marker_pub_ = node_->create_publisher<visualization_msgs::msg::MarkerArray>(
         "/solder_process_markers", rclcpp::QoS(1).transient_local());
@@ -153,15 +167,19 @@ public:
       const ArmSide solderer = holder == ArmSide::LEFT ? ArmSide::RIGHT : ArmSide::LEFT;
       dwell_ = node_->get_parameter("solder.dwell_seconds").as_double();
       clearance_ = node_->get_parameter("solder.approach_height").as_double();
+      planner_timeout_seconds_ = node_->get_parameter("solder.planner_timeout_seconds").as_double();
       if (!std::isfinite(dwell_) || dwell_ < 0.0 || dwell_ > 30.0 ||
-          !std::isfinite(clearance_) || clearance_ < 0.02 || clearance_ > 0.15)
-        throw std::runtime_error("Invalid dwell_seconds (0..30) or approach_height (0.02..0.15)");
+          !std::isfinite(clearance_) || clearance_ < 0.02 || clearance_ > 0.15 ||
+          !std::isfinite(planner_timeout_seconds_) || planner_timeout_seconds_ < 0.1 ||
+          planner_timeout_seconds_ > 10.0)
+        throw std::runtime_error("Invalid solder dwell, approach height, or planner settings");
       if (!scene_.getAttachedObjects().empty())
         throw std::runtime_error("Start SOLDER with both hands free; inspect status after a failed task");
 
       Group holder_group(node_, prefix(holder) + "ur_onrobot_manipulator");
       Group tool_group(node_, prefix(solderer) + "ur_onrobot_manipulator");
       configure(holder_group, holder); configure(tool_group, solderer);
+      refreshPlannerCatalog(tool_group);
       const auto model = holder_group.getRobotModel();
       const auto* holder_hand = model->getJointModelGroup(prefix(holder) + "ur_onrobot_gripper");
       const auto* tool_hand = model->getJointModelGroup(prefix(solderer) + "ur_onrobot_gripper");
@@ -278,8 +296,11 @@ public:
         }
         status("HOLDER_CLEAR " + std::to_string(i));
 
-        for (std::size_t pad = 0; pad < 2; ++pad) {
-          solderPad(tool_group, board, hand_to_tip, i, pad, solderer);
+        if (i == 3) {
+          solderCircularSeam(tool_group, board, hand_to_tip, i, solderer);
+        } else {
+          for (std::size_t pad = 0; pad < 2; ++pad)
+            solderPad(tool_group, board, hand_to_tip, i, pad, solderer);
         }
 
         completed_.insert(i);
@@ -557,15 +578,21 @@ private:
     run(group, result);
   }
 
-  bool planCartesian(Group& group, const Transform& target,
-                     const moveit::core::RobotState& start, Group::Plan& result)
+  bool planCartesian(Group& group, const std::vector<Transform>& targets,
+                     const moveit::core::RobotState& start, Group::Plan& result,
+                     bool log_incomplete = true)
   {
+    if (targets.empty()) return false;
     group.setStartState(start);
+    std::vector<geometry_msgs::msg::Pose> waypoints;
+    waypoints.reserve(targets.size());
+    for (const auto& target : targets) waypoints.push_back(pose(target));
     moveit_msgs::msg::RobotTrajectory message;
-    const double fraction = group.computeCartesianPath({pose(target)}, 0.002, 1.5, message, true);
+    const double fraction = group.computeCartesianPath(waypoints, 0.002, 1.5, message, true);
     if (!std::isfinite(fraction) || fraction < 0.999 || message.joint_trajectory.points.empty()) {
-      RCLCPP_WARN(node_->get_logger(), "SOLDER Cartesian plan incomplete: group=%s fraction=%.4f",
-                  group.getName().c_str(), fraction);
+      if (log_incomplete)
+        RCLCPP_WARN(node_->get_logger(), "SOLDER Cartesian plan incomplete: group=%s fraction=%.4f",
+                    group.getName().c_str(), fraction);
       return false;
     }
     robot_trajectory::RobotTrajectory trajectory(group.getRobotModel(), group.getName());
@@ -575,6 +602,13 @@ private:
     moveit::core::robotStateToRobotStateMsg(start, result.start_state_);
     trajectory.getRobotTrajectoryMsg(result.trajectory_);
     return true;
+  }
+
+  bool planCartesian(Group& group, const Transform& target,
+                     const moveit::core::RobotState& start, Group::Plan& result,
+                     bool log_incomplete = true)
+  {
+    return planCartesian(group, std::vector<Transform>{target}, start, result, log_incomplete);
   }
 
   bool tryCartesian(Group& group, const Transform& target, double& fraction)
@@ -638,19 +672,266 @@ private:
     int poses = 0, ik = 0, collision_free = 0, transfers = 0, descents = 0;
   };
 
-  bool planPadApproach(Group& group, const planning_scene::PlanningScenePtr& scene,
-                       const Transform& above, const Transform& contact,
-                       Group::Plan& approach_plan, Group::Plan& contact_plan,
-                       PadSearchStats& stats)
+  struct PadPlanCandidate
   {
-    // Bound expensive OMPL calls. Unreachable orientations are filtered by IK
-    // first instead of spending the full planning timeout on every one.
+    Transform above;
+    Transform contact;
+    Group::Plan transfer;
+    Group::Plan descent;
+    Eigen::Vector3d direction = Eigen::Vector3d::Zero();
+    double clearance = 0.0;
+    double tilt_deg = 0.0;
+    int roll_deg = 0;
+    double tcp_length = 0.0;
+    double joint_length = 0.0;
+    double duration = 0.0;
+    double smoothness = 0.0;
+    std::string planner;
+    double score = 0.0;
+  };
+
+  struct PlannerTrial
+  {
+    std::string pipeline;
+    std::string planner_id;
+    bool pose_goal = false;
+  };
+
+  static PlannerTrial parsePlannerTrial(const std::string& value)
+  {
+    const auto separator = value.find(':');
+    if (separator == std::string::npos || separator == 0)
+      throw std::runtime_error("Invalid solder.planner_trials entry: " + value +
+                               " (expected pipeline:planner_id)");
+    PlannerTrial trial;
+    trial.pipeline = value.substr(0, separator);
+    trial.planner_id = value.substr(separator + 1);
+    trial.pose_goal = trial.pipeline == "pilz_industrial_motion_planner" &&
+                      trial.planner_id == "LIN";
+    return trial;
+  }
+
+  void refreshPlannerCatalog(Group& group)
+  {
+    available_planners_.clear();
+    available_pipeline_plugins_.clear();
+    planner_catalog_available_ = false;
+    std::vector<moveit_msgs::msg::PlannerInterfaceDescription> descriptions;
+    if (!group.getInterfaceDescriptions(descriptions)) {
+      RCLCPP_WARN(node_->get_logger(),
+                  "SOLDER could not query loaded planner pipelines; configured trials will be attempted as-is");
+      return;
+    }
+    planner_catalog_available_ = true;
+    planner_trials_.clear();
+    for (const auto& description : descriptions) {
+      const std::set<std::string> ids(description.planner_ids.begin(), description.planner_ids.end());
+      available_planners_[description.pipeline_id] = ids;
+      available_pipeline_plugins_[description.pipeline_id] = description.name;
+      RCLCPP_INFO(node_->get_logger(), "SOLDER loaded pipeline=%s plugin=%s planners=%zu",
+                  description.pipeline_id.c_str(), description.name.c_str(), ids.size());
+
+      std::string plugin = description.name;
+      std::transform(plugin.begin(), plugin.end(), plugin.begin(),
+                     [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+      if (planner_trials_.empty() && plugin.find("ompl") != std::string::npos) {
+        std::string selected_id;
+        // Prefer the conventional name, but accept custom planner config IDs
+        // that still identify the RRTConnect algorithm.
+        for (const auto& id : description.planner_ids) {
+          if (id == "RRTConnectkConfigDefault") {
+            selected_id = id;
+            break;
+          }
+          std::string lowered = id;
+          std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+                         [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+          if (selected_id.empty() && lowered.find("rrtconnect") != std::string::npos)
+            selected_id = id;
+        }
+
+        // An empty planner ID delegates to the default planner configured for
+        // this pipeline when no RRTConnect-specific ID is advertised.
+        planner_trials_.push_back(description.pipeline_id + ":" + selected_id);
+        RCLCPP_INFO(node_->get_logger(), "SOLDER selected planner trial=%s:%s",
+                    description.pipeline_id.c_str(),
+                    selected_id.empty() ? "<pipeline default>" : selected_id.c_str());
+      }
+    }
+    if (planner_trials_.empty())
+      RCLCPP_WARN(node_->get_logger(),
+                  "SOLDER planner catalog has no OMPL pipeline; only direct Cartesian transfer will be tried");
+  }
+
+  std::string resolvePipelineId(const std::string& requested) const
+  {
+    if (available_planners_.count(requested)) return requested;
+
+    std::string alias = requested;
+    std::transform(alias.begin(), alias.end(), alias.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    for (const auto& entry : available_pipeline_plugins_) {
+      std::string plugin = entry.second;
+      std::transform(plugin.begin(), plugin.end(), plugin.begin(),
+                     [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+      if (plugin.find(alias) != std::string::npos) return entry.first;
+    }
+    return requested;
+  }
+
+  bool plannerTrialAvailable(const PlannerTrial& trial) const
+  {
+    if (!planner_catalog_available_) return true;
+    const auto pipeline = available_planners_.find(resolvePipelineId(trial.pipeline));
+    if (pipeline == available_planners_.end()) return false;
+    return trial.planner_id.empty() || pipeline->second.count(trial.planner_id) != 0;
+  }
+
+  static double trajectoryDuration(const Group::Plan& plan)
+  {
+    const auto& points = plan.trajectory_.joint_trajectory.points;
+    if (points.empty()) return std::numeric_limits<double>::infinity();
+    const auto& t = points.back().time_from_start;
+    return static_cast<double>(t.sec) + static_cast<double>(t.nanosec) * 1e-9;
+  }
+
+  static double trajectoryJointLength(const Group::Plan& plan)
+  {
+    const auto& points = plan.trajectory_.joint_trajectory.points;
+    if (points.empty()) return std::numeric_limits<double>::infinity();
+
+    double length = 0.0;
+    for (std::size_t i = 1; i < points.size(); ++i) {
+      if (points[i].positions.size() != points[i - 1].positions.size())
+        return std::numeric_limits<double>::infinity();
+      for (std::size_t j = 0; j < points[i].positions.size(); ++j)
+        length += std::abs(points[i].positions[j] - points[i - 1].positions[j]);
+    }
+    return length;
+  }
+
+  static double trajectoryTcpLength(const Group::Plan& plan,
+                                    const moveit::core::RobotModelConstPtr& model,
+                                    const std::string& group_name,
+                                    const std::string& end_effector)
+  {
+    if (plan.trajectory_.joint_trajectory.points.empty() || end_effector.empty())
+      return std::numeric_limits<double>::infinity();
+
+    moveit::core::RobotState start(model);
+    moveit::core::robotStateMsgToRobotState(plan.start_state_, start);
+    robot_trajectory::RobotTrajectory trajectory(model, group_name);
+    trajectory.setRobotTrajectoryMsg(start, plan.trajectory_);
+    if (trajectory.getWayPointCount() < 2)
+      return 0.0;
+
+    Eigen::Vector3d previous =
+        trajectory.getWayPoint(0).getGlobalLinkTransform(end_effector).translation();
+    double length = 0.0;
+    for (std::size_t i = 1; i < trajectory.getWayPointCount(); ++i) {
+      const Eigen::Vector3d current =
+          trajectory.getWayPoint(i).getGlobalLinkTransform(end_effector).translation();
+      length += (current - previous).norm();
+      previous = current;
+    }
+    return length;
+  }
+
+  static double trajectorySmoothness(const Group::Plan& plan)
+  {
+    const auto& points = plan.trajectory_.joint_trajectory.points;
+    if (points.size() < 3) return 0.0;
+
+    const auto seconds = [](const auto& time) {
+      return static_cast<double>(time.sec) + static_cast<double>(time.nanosec) * 1e-9;
+    };
+    double smoothness = 0.0;
+    double previous_dt = 0.0;
+    std::vector<double> previous_velocity;
+    for (std::size_t i = 1; i < points.size(); ++i) {
+      if (points[i].positions.size() != points[i - 1].positions.size())
+        return std::numeric_limits<double>::infinity();
+
+      const double dt = seconds(points[i].time_from_start) -
+                        seconds(points[i - 1].time_from_start);
+      if (!std::isfinite(dt) || dt <= 1e-9)
+        return std::numeric_limits<double>::infinity();
+
+      std::vector<double> velocity(points[i].positions.size());
+      for (std::size_t j = 0; j < velocity.size(); ++j)
+        velocity[j] = (points[i].positions[j] - points[i - 1].positions[j]) / dt;
+
+      if (!previous_velocity.empty()) {
+        const double interval = 0.5 * (previous_dt + dt);
+        if (interval <= 1e-9)
+          return std::numeric_limits<double>::infinity();
+        for (std::size_t j = 0; j < velocity.size(); ++j) {
+          const double acceleration = (velocity[j] - previous_velocity[j]) / interval;
+          smoothness += acceleration * acceleration * interval;
+        }
+      }
+      previous_velocity = std::move(velocity);
+      previous_dt = dt;
+    }
+    return smoothness;
+  }
+
+  static void scoreCandidates(std::vector<PadPlanCandidate>& candidates)
+  {
+    if (candidates.empty()) return;
+
+    const auto range_for = [&](auto metric) {
+      double minimum = std::numeric_limits<double>::infinity();
+      double maximum = -std::numeric_limits<double>::infinity();
+      for (const auto& candidate : candidates) {
+        const double value = metric(candidate);
+        minimum = std::min(minimum, value);
+        maximum = std::max(maximum, value);
+      }
+      return std::pair<double, double>{minimum, maximum};
+    };
+    const auto normalized = [](double value, const std::pair<double, double>& range) {
+      const double span = range.second - range.first;
+      return span > 1e-9 ? (value - range.first) / span : 0.0;
+    };
+
+    const auto joint_length_range = range_for([](const auto& c) { return c.joint_length; });
+    const auto duration_range = range_for([](const auto& c) { return c.duration; });
+    const auto smoothness_range = range_for([](const auto& c) { return c.smoothness; });
+    const auto clearance_range = range_for([](const auto& c) { return c.clearance; });
+
+    for (auto& candidate : candidates) {
+      // Collision checks are hard filters. This small higher-clearance preference
+      // is a geometric proxy, not an exact minimum-distance measurement.
+      const double clearance_preference =
+          1.0 - normalized(candidate.clearance, clearance_range);
+      // TCP path length is the primary objective and is compared directly
+      // when ranking candidates. These metrics only break near-equal-length ties.
+      candidate.score =
+          0.50 * normalized(candidate.joint_length, joint_length_range) +
+          0.25 * normalized(candidate.duration, duration_range) +
+          0.20 * normalized(candidate.smoothness, smoothness_range) +
+          0.05 * clearance_preference;
+    }
+  }
+
+  void planPadApproach(Group& group, const planning_scene::PlanningScenePtr& scene,
+                       const Transform& above, const std::vector<Transform>& contact_path,
+                       std::vector<PadPlanCandidate>& candidates,
+                       PadSearchStats& stats, const Eigen::Vector3d& direction,
+                       double tilt_deg, int roll_deg, double clearance)
+  {
+    // Bound calls across the enabled planner portfolio and retain feasible
+    // alternatives instead of stopping at the first plan.
     constexpr int max_transfer_plans = 16;
-    if (stats.transfers >= max_transfer_plans) return false;
+    if (stats.transfers >= max_transfer_plans) return;
     ++stats.poses;
     const auto* joints = group.getRobotModel()->getJointModelGroup(group.getName());
     if (!joints) throw std::runtime_error("Missing solder arm joint group");
-    for (int attempt = 0; attempt < 3 && stats.transfers < max_transfer_plans; ++attempt) {
+    const std::size_t candidates_before = candidates.size();
+    for (int attempt = 0; attempt < 3 &&
+         stats.transfers < max_transfer_plans &&
+         candidates.size() == candidates_before; ++attempt) {
       moveit::core::RobotState candidate(scene->getCurrentState());
       if (attempt) candidate.setToRandomPositions(joints);
       candidate.update();
@@ -664,136 +945,455 @@ private:
       }
       ++stats.collision_free;
 
-      // Verify the whole contact segment with both objects attached before
-      // asking OMPL to transfer to this particular IK branch.
-      if (!planCartesian(group, contact, candidate, contact_plan)) continue;
+      // Check the complete descent and solder stroke with the iron attached.
+      Group::Plan contact_plan;
+      if (!planCartesian(group, contact_path, candidate, contact_plan)) continue;
       ++stats.descents;
+
+      const auto recordCandidate = [&](Group::Plan&& approach_plan,
+                                       const std::string& planner_name) {
+        // Recheck the descent from the actual end state of this planner's route.
+        moveit::core::RobotState start(scene->getCurrentState());
+        moveit::core::robotStateMsgToRobotState(approach_plan.start_state_, start);
+        robot_trajectory::RobotTrajectory transfer(group.getRobotModel(), group.getName());
+        transfer.setRobotTrajectoryMsg(start, approach_plan.trajectory_);
+        if (!transfer.getWayPointCount()) return false;
+        Group::Plan verified_contact;
+        if (!planCartesian(group, contact_path, transfer.getLastWayPoint(), verified_contact))
+          return false;
+
+        PadPlanCandidate option;
+        option.above = above;
+        option.contact = contact_path.front();
+        option.transfer = std::move(approach_plan);
+        option.descent = std::move(verified_contact);
+        option.direction = direction;
+        option.clearance = clearance;
+        option.tilt_deg = tilt_deg;
+        option.roll_deg = roll_deg;
+        option.planner = planner_name;
+        const auto model = group.getRobotModel();
+        const std::string end_effector = group.getEndEffectorLink();
+        option.tcp_length =
+            trajectoryTcpLength(option.transfer, model, group.getName(), end_effector) +
+            trajectoryTcpLength(option.descent, model, group.getName(), end_effector);
+        option.joint_length =
+            trajectoryJointLength(option.transfer) + trajectoryJointLength(option.descent);
+        option.duration =
+            trajectoryDuration(option.transfer) + trajectoryDuration(option.descent);
+        option.smoothness =
+            trajectorySmoothness(option.transfer) + trajectorySmoothness(option.descent);
+        if (!std::isfinite(option.tcp_length) || !std::isfinite(option.joint_length) ||
+            !std::isfinite(option.duration) || !std::isfinite(option.smoothness)) {
+          RCLCPP_WARN(node_->get_logger(),
+                      "SOLDER PAD discarded %s plan with invalid trajectory metrics",
+                      planner_name.c_str());
+          return false;
+        }
+        RCLCPP_INFO(node_->get_logger(), "SOLDER PAD feasible planner=%s tcp_length=%.3f",
+                    planner_name.c_str(), option.tcp_length);
+        candidates.push_back(std::move(option));
+        return true;
+      };
+
+      // First try a collision-checked straight Cartesian transfer.
+      ++stats.transfers;
+      Group::Plan direct_plan;
+      moveit::core::RobotState current(scene->getCurrentState());
+      if (planCartesian(group, above, current, direct_plan, false))
+        recordCandidate(std::move(direct_plan), "CARTESIAN_DIRECT");
+
+      // Also ask each configured MoveIt pipeline for an alternative. This
+      // portfolio lets the TCP-length ranking compare real planner outputs.
       std::vector<double> values;
       candidate.copyJointGroupPositions(joints, values);
-      group.clearPoseTargets();
-      group.setStartStateToCurrentState();
-      if (!group.setJointValueTarget(values)) continue;
-      ++stats.transfers;
-      const double saved_time = group.getPlanningTime();
-      group.setPlanningTime(4.0);
-      const auto code = group.plan(approach_plan);
-      group.setPlanningTime(saved_time);
-      if (code != moveit::core::MoveItErrorCode::SUCCESS) {
-        RCLCPP_WARN(node_->get_logger(), "SOLDER PAD transfer failed: code=%d", code.val);
-        continue;
+      const std::string original_pipeline = group.getPlanningPipelineId();
+      const std::string original_planner = group.getPlannerId();
+      const double original_planning_time = group.getPlanningTime();
+      for (const auto& raw_trial : planner_trials_) {
+        if (stats.transfers >= max_transfer_plans) break;
+        const PlannerTrial trial = parsePlannerTrial(raw_trial);
+        const std::string planner_name = trial.pipeline + ":" +
+            (trial.planner_id.empty() ? std::string("default") : trial.planner_id);
+        if (!plannerTrialAvailable(trial)) {
+          if (warned_unavailable_planners_.insert(planner_name).second)
+            RCLCPP_WARN(node_->get_logger(),
+                        "SOLDER planner trial skipped because it is not loaded/configured: %s",
+                        planner_name.c_str());
+          continue;
+        }
+        const std::string resolved_pipeline = resolvePipelineId(trial.pipeline);
+        if (resolved_pipeline != trial.pipeline) {
+          const auto plugin = available_pipeline_plugins_.find(resolved_pipeline);
+          RCLCPP_INFO(node_->get_logger(),
+                      "SOLDER planner alias resolved: %s -> %s (plugin=%s)",
+                      trial.pipeline.c_str(), resolved_pipeline.c_str(),
+                      plugin == available_pipeline_plugins_.end() ? "unknown" : plugin->second.c_str());
+        }
+        const std::string resolved_planner_name = resolved_pipeline + ":" +
+            (trial.planner_id.empty() ? std::string("default") : trial.planner_id);
+        group.clearPoseTargets();
+        group.setStartStateToCurrentState();
+        group.setPlanningPipelineId(resolved_pipeline);
+        group.setPlannerId(trial.planner_id);
+
+        const bool target_set = trial.pose_goal
+                                    ? group.setPoseTarget(pose(above))
+                                    : group.setJointValueTarget(values);
+        if (!target_set) {
+          RCLCPP_WARN(node_->get_logger(),
+                      "SOLDER cannot set goal for pipeline=%s planner=%s",
+                      trial.pipeline.c_str(), trial.planner_id.c_str());
+          group.clearPoseTargets();
+          group.setPlanningPipelineId(original_pipeline);
+          group.setPlannerId(original_planner);
+          continue;
+        }
+
+        Group::Plan planner_plan;
+        group.setPlanningTime(planner_timeout_seconds_);
+        ++stats.transfers;
+        const auto code = group.plan(planner_plan);
+        group.setPlanningTime(original_planning_time);
+        group.clearPoseTargets();
+        group.setPlanningPipelineId(original_pipeline);
+        group.setPlannerId(original_planner);
+        if (code != moveit::core::MoveItErrorCode::SUCCESS) {
+          RCLCPP_WARN(node_->get_logger(),
+                      "SOLDER planner failed: %s code=%d (pipeline may not be loaded)",
+                      resolved_planner_name.c_str(), code.val);
+          continue;
+        }
+        recordCandidate(std::move(planner_plan), resolved_planner_name);
       }
-      // Recompute contact from the actual end of the returned transfer plan,
-      // retaining attached objects and the stationary holder's joint state.
-      moveit::core::RobotState start(scene->getCurrentState());
-      moveit::core::robotStateMsgToRobotState(approach_plan.start_state_, start);
-      robot_trajectory::RobotTrajectory transfer(group.getRobotModel(), group.getName());
-      transfer.setRobotTrajectoryMsg(start, approach_plan.trajectory_);
-      if (transfer.getWayPointCount() &&
-          planCartesian(group, contact, transfer.getLastWayPoint(), contact_plan)) return true;
     }
-    return false;
   }
 
   void solderPad(Group& group, const Transform& board, const Transform& hand_to_tip,
                   int component, std::size_t pad, ArmSide solderer)
   {
-    // padOffset() returns the centre of the pad's top face: its Z coordinate
-    // includes board half-thickness, pad height above the board, and half the
-    // pad thickness. Target that surface directly so the modeled tip endpoint
-    // makes contact instead of hovering above it.
-    const Eigen::Vector3d pad_position = board * vector(pcb::padOffset(component - 1, pad));
-    const Eigen::Vector3d normal = board.linear().col(2);
-    const Eigen::Vector3d tip_position = pad_position;
-    status("SEARCH_PAD " + std::to_string(component) + ":" + std::to_string(pad + 1));
-    RCLCPP_INFO(node_->get_logger(), "SOLDER PAD CONTACT TARGET component=%d pad=%zu tip_world=(%.4f %.4f %.4f)",
-                component, pad + 1, tip_position.x(), tip_position.y(), tip_position.z());
+    const std::string object_id = "component_" + std::to_string(component);
+    const Transform component_pose = worldPose(object_id);
+    const auto component_objects = scene_.getObjects({object_id});
+    const auto component_it = component_objects.find(object_id);
+    if (component_it == component_objects.end() || component_it->second.primitives.size() != 1 ||
+        component_it->second.primitives.front().type != shape_msgs::msg::SolidPrimitive::BOX ||
+        component_it->second.primitives.front().dimensions.size() != 3)
+      throw std::runtime_error("Pad-edge welding requires one box-shaped component: " + object_id);
+    const auto& dimensions = component_it->second.primitives.front().dimensions;
+    const double component_x = dimensions[shape_msgs::msg::SolidPrimitive::BOX_X];
+    const double component_y = dimensions[shape_msgs::msg::SolidPrimitive::BOX_Y];
+    const Eigen::Vector3d component_reference = vector(pcb::componentOffset(component - 1));
+    const Eigen::Vector3d pad_reference = vector(pcb::padOffset(component - 1, pad));
+    const Eigen::Vector3d pad_offset = pad_reference - component_reference;
+
+    // The pad offset tells which side of the component contains this pad.
+    // The weld stroke follows that side's edge, perpendicular to the offset.
+    Eigen::Vector3d edge_axis_local;
+    double edge_length = 0.0;
+    if (std::abs(pad_offset.x()) >= std::abs(pad_offset.y())) {
+      edge_axis_local = Eigen::Vector3d::UnitY();
+      edge_length = component_y;
+    } else {
+      edge_axis_local = Eigen::Vector3d::UnitX();
+      edge_length = component_x;
+    }
+    const double side_offset = std::hypot(pad_offset.x(), pad_offset.y());
+    if (!std::isfinite(side_offset) || side_offset < 1e-6 ||
+        !std::isfinite(edge_length) || edge_length <= 0.0)
+      throw std::runtime_error("Cannot derive rectangular pad edge from PCB geometry");
+
+    // Transform the geometry-relative pad center and edge axis through the
+    // component's actual pose after placement. This keeps the stroke aligned
+    // if the PCB/component pose changes in the planning scene.
+    const Eigen::Vector3d pad_center = component_pose * pad_offset;
+    const Eigen::Vector3d half_edge =
+        component_pose.linear() * (0.5 * edge_length * edge_axis_local);
+    std::vector<Eigen::Vector3d> pad_edge_points{
+        pad_center - half_edge,
+        pad_center + half_edge};
+
+    // Shift the simulated weld seam 2 mm along world X, away from the
+    // component. Pad 1 in the current scene is on negative X, so its seam
+    // moves toward -X; the opposite pad moves toward +X.
+    constexpr double weld_x_offset = 0.002;
+    const double outward_x = pad_center.x() - component_pose.translation().x();
+    const double x_sign = outward_x < 0.0 ? -1.0 : 1.0;
+    const Eigen::Vector3d weld_shift(x_sign * weld_x_offset, 0.0, 0.0);
+    for (auto& point : pad_edge_points) point += weld_shift;
+
+    RCLCPP_INFO(node_->get_logger(),
+                "SOLDER PAD EDGE component=%d pad=%zu length=%.4f x_offset=%.4f start=(%.4f %.4f %.4f) end=(%.4f %.4f %.4f)",
+                component, pad + 1, edge_length, weld_shift.x(),
+                pad_edge_points.front().x(), pad_edge_points.front().y(), pad_edge_points.front().z(),
+                pad_edge_points.back().x(), pad_edge_points.back().y(), pad_edge_points.back().z());
+    solderPath(group, board, hand_to_tip, component, pad, solderer,
+               pad_edge_points, false, Eigen::Vector3d::Zero());
+  }
+
+  void solderCircularSeam(Group& group, const Transform& board, const Transform& hand_to_tip,
+                          int component, ArmSide solderer)
+  {
+    const std::string object_id = "component_" + std::to_string(component);
+    const auto objects = scene_.getObjects({object_id});
+    const auto object = objects.find(object_id);
+    if (object == objects.end() || object->second.header.frame_id != "world" ||
+        object->second.primitives.size() != 1 || object->second.primitive_poses.size() != 1 ||
+        object->second.primitives.front().type != shape_msgs::msg::SolidPrimitive::CYLINDER)
+      throw std::runtime_error("Circular seam needs one world-frame cylinder: " + object_id);
+
+    // Use the object's world pose as the cylinder centre, matching the pose
+    // used for component placement. Treating primitive_poses.front() as the
+    // world centre placed the seam below the PCB in the previous run (z=-0.007 m).
+    const Transform cylinder = worldPose(object_id);
+    const Eigen::Vector3d board_normal = board.linear().col(2).normalized();
+    Eigen::Vector3d cylinder_axis = cylinder.linear().col(2).normalized();
+    if (std::abs(cylinder_axis.dot(board_normal)) < 0.98)
+      throw std::runtime_error("Circular component axis is not perpendicular to the PCB");
+    if (cylinder_axis.dot(board_normal) < 0.0) cylinder_axis = -cylinder_axis;
+
+    // Trace the round foot where it meets the PCB. The cylinder's collision
+    // model supplies the centre and radius, so this follows the scene geometry.
+    const double radius = object->second.primitives.front().dimensions.at(
+        shape_msgs::msg::SolidPrimitive::CYLINDER_RADIUS);
+    constexpr double seam_radial_offset = 0.002;  // 2 mm outside the cylinder surface
+    const double path_radius = radius + seam_radial_offset;
+    const Eigen::Vector3d seam_center =
+        cylinder.translation() - cylinder_axis * (pcb::component_z / 2.0);
+    RCLCPP_INFO(node_->get_logger(),
+                "SOLDER CIRCULAR GEOMETRY component_center=(%.4f %.4f %.4f) axis=(%.3f %.3f %.3f) radius=%.4f path_radius=%.4f radial_offset=%.4f seam_center=(%.4f %.4f %.4f)",
+                cylinder.translation().x(), cylinder.translation().y(), cylinder.translation().z(),
+                cylinder_axis.x(), cylinder_axis.y(), cylinder_axis.z(), radius, path_radius,
+                seam_radial_offset,
+                seam_center.x(), seam_center.y(), seam_center.z());
+    Eigen::Vector3d u = board.linear().col(0);
+    u -= board_normal * u.dot(board_normal);
+    u.normalize();
+    const Eigen::Vector3d v = board_normal.cross(u).normalized();
+
+    constexpr int samples = 48;
+    std::vector<Eigen::Vector3d> seam_points;
+    seam_points.reserve(samples + 1);
+    for (int i = 0; i <= samples; ++i) {
+      const double angle = 2.0 * M_PI * static_cast<double>(i) / samples;
+      seam_points.push_back(seam_center + path_radius * (std::cos(angle) * u + std::sin(angle) * v));
+    }
+    solderPath(group, board, hand_to_tip, component, 0, solderer,
+               seam_points, true, seam_center);
+  }
+
+  void solderPath(Group& group, const Transform& board, const Transform& hand_to_tip,
+                  int component, std::size_t pad, ArmSide solderer,
+                  const std::vector<Eigen::Vector3d>& requested_points,
+                  bool circular_seam, const Eigen::Vector3d& seam_center)
+  {
+    if (requested_points.empty()) throw std::runtime_error("Empty solder contact path");
+    std::vector<Eigen::Vector3d> contact_points = requested_points;
+    const Eigen::Vector3d normal = board.linear().col(2).normalized();
+    GraspContacts seam_contacts(node_);
+    if (circular_seam) {
+      // Permit only the solder iron to touch the intended seam and PCB while
+      // planning/executing this visual weld stroke. The saved ACM is restored.
+      seam_contacts.allow("component_" + std::to_string(component), {"solder_tool"});
+      seam_contacts.allow("pcb", {"solder_tool"});
+    }
+
+    status(circular_seam
+               ? "SEARCH_CIRCULAR_SEAM " + std::to_string(component)
+               : "SEARCH_PAD " + std::to_string(component) + ":" + std::to_string(pad + 1));
     auto scene = snapshot(group);
     moveit::core::RobotState start(scene->getCurrentState());
     start.update();
     if (!start.satisfiesBounds() || scene->isStateColliding(start, "", false)) {
-      logContacts(scene, start, "PAD START");
-      throw std::runtime_error("Invalid start state at pad search");
+      logContacts(scene, start, circular_seam ? "SEAM START" : "PAD START");
+      throw std::runtime_error("Invalid start state at solder path search");
     }
     const std::string base_link = prefix(solderer) + "base_link";
     if (!group.getRobotModel()->getLinkModel(base_link))
       throw std::runtime_error("Missing solder arm base link: " + base_link);
 
-    // Point from the handle toward the pad. Favour putting the handle toward
-    // this arm's base, while keeping it outside the component on the pad side.
-    const double sign = pad == 0 ? 1.0 : -1.0;
-    Eigen::Vector3d preferred = board.linear().transpose() *
-        (pad_position - start.getGlobalLinkTransform(base_link).translation());
-    preferred.z() = 0.0;
-    preferred.x() = sign * std::abs(preferred.x());
-    if (preferred.norm() < 1e-6) preferred = Eigen::Vector3d(sign, 0, 0);
-    preferred.normalize();
-    std::vector<Eigen::Vector3d> directions{preferred};
-    for (double azimuth_deg : {-75.0, -45.0, 0.0, 45.0, 75.0}) {
-      const double a = azimuth_deg * M_PI / 180.0;
-      const Eigen::Vector3d direction(sign * std::cos(a), std::sin(a), 0);
-      if ((direction - preferred).norm() > 1e-6) directions.push_back(direction);
-    }
-    std::stable_sort(directions.begin(), directions.end(), [&](const auto& a, const auto& b) {
-      return a.dot(preferred) > b.dot(preferred);
-    });
+    Eigen::Vector3d preferred;
+    if (circular_seam) {
+      preferred = start.getGlobalLinkTransform(base_link).translation() - seam_center;
+      preferred -= normal * preferred.dot(normal);
+      if (preferred.norm() < 1e-6) preferred = board.linear().col(0);
+      preferred.normalize();
 
-    Group::Plan approach_plan, contact_plan;
-    Transform contact = Transform::Identity(), above = Transform::Identity();
-    bool found = false;
-    PadSearchStats stats;
-    double previous_height = -1.0;
-    for (double height : {0.02, std::min(clearance_, 0.04), clearance_}) {
-      if (std::abs(height - previous_height) < 1e-6) continue;
-      previous_height = height;
-      for (const auto& direction : directions) {
-        const Eigen::Vector3d horizontal = board.linear() * direction;
-        const Eigen::Vector3d across = normal.cross(horizontal).normalized();
-        // Tip-frame +X points toward the pad. Tilt from the board normal,
-        // rather than restricting every approach to the board's X-Z plane.
-        for (double tilt_deg : {60.0, 45.0, 30.0}) {
-          const double angle = tilt_deg * M_PI / 180.0;
-          const Eigen::Vector3d axis = horizontal * std::sin(angle) - normal * std::cos(angle);
-          Transform tip = Transform::Identity();
-          tip.linear().col(0) = axis;
-          tip.linear().col(1) = across;
-          tip.linear().col(2) = axis.cross(across);
-          tip.translation() = tip_position;
-          for (int roll = 0; roll < 4; ++roll) {
-            Transform oriented = tip;
-            oriented.linear() = tip.linear() *
-                Eigen::AngleAxisd(roll * M_PI / 2.0, Eigen::Vector3d::UnitX()).toRotationMatrix();
-            contact = oriented * hand_to_tip.inverse();
-            above = contact;
-            above.translation() += normal * height;
-            if (planPadApproach(group, scene, above, contact, approach_plan, contact_plan, stats)) {
-              RCLCPP_INFO(node_->get_logger(),
-                          "SOLDER PAD plan selected: tilt=%.0f roll=%d clearance=%.3f direction=(%.3f %.3f)",
-                          tilt_deg, roll * 90, height, direction.x(), direction.y());
-              found = true;
-              break;
-            }
-          }
-          if (found) break;
-        }
-        if (found) break;
-      }
-      if (found) break;
+      // Start on the side facing the soldering arm; the remaining samples form
+      // one complete closed circumference.
+      Eigen::Vector3d first_radial = contact_points.front() - seam_center;
+      first_radial -= normal * first_radial.dot(normal);
+      first_radial.normalize();
+      const double phase = std::atan2(normal.dot(first_radial.cross(preferred)),
+                                      first_radial.dot(preferred));
+      const Eigen::Matrix3d rotate =
+          Eigen::AngleAxisd(phase, normal).toRotationMatrix();
+      for (auto& point : contact_points)
+        point = seam_center + rotate * (point - seam_center);
+    } else {
+      const double sign = pad == 0 ? 1.0 : -1.0;
+      preferred = board.linear().transpose() *
+          (contact_points.front() - start.getGlobalLinkTransform(base_link).translation());
+      preferred.z() = 0.0;
+      preferred.x() = sign * std::abs(preferred.x());
+      if (preferred.norm() < 1e-6) preferred = Eigen::Vector3d(sign, 0, 0);
+      preferred.normalize();
     }
+
+    const Eigen::Vector3d tip_position = contact_points.front();
     RCLCPP_INFO(node_->get_logger(),
-                "SOLDER PAD SEARCH poses=%d IK=%d collision_free=%d descents=%d transfer_plans=%d success=%d",
-                stats.poses, stats.ik, stats.collision_free, stats.descents, stats.transfers, found);
-    if (!found) throw std::runtime_error("No complete solder approach/contact plan; see SOLDER PAD SEARCH");
-    status("APPROACH_PAD " + std::to_string(component) + ":" + std::to_string(pad + 1));
-    run(group, approach_plan);
-    run(group, contact_plan);
-    status("DWELL_PAD " + std::to_string(component) + ":" + std::to_string(pad + 1));
+                "SOLDER %s TARGET component=%d path_points=%zu start_world=(%.4f %.4f %.4f)",
+                circular_seam ? "CIRCULAR_SEAM" : "PAD", component,
+                contact_points.size(), tip_position.x(), tip_position.y(), tip_position.z());
+
+    std::vector<Eigen::Vector3d> directions;
+    if (circular_seam) {
+      directions.push_back(board.linear().transpose() * preferred);
+    } else {
+      directions.push_back(preferred);
+      // Search all sides of the pad. Restricting X by pad index can exclude
+      // the only reachable IK branch for the opposite pad.
+      for (double azimuth_deg : {-180.0, -135.0, -90.0, -45.0,
+                                  0.0, 45.0, 90.0, 135.0}) {
+        const double a = azimuth_deg * M_PI / 180.0;
+        const Eigen::Vector3d direction(std::cos(a), std::sin(a), 0);
+        if ((direction - preferred).norm() > 1e-6) directions.push_back(direction);
+      }
+      std::stable_sort(directions.begin(), directions.end(), [&](const auto& a, const auto& b) {
+        return a.dot(preferred) > b.dot(preferred);
+      });
+    }
+
+    std::vector<double> heights;
+    for (double height : {0.02, std::min(clearance_, 0.04), clearance_}) {
+      const bool duplicate = std::any_of(heights.begin(), heights.end(), [&](double existing) {
+        return std::abs(existing - height) < 1e-6;
+      });
+      if (!duplicate) heights.push_back(height);
+    }
+
+    std::vector<PadPlanCandidate> candidates;
+    PadSearchStats stats;
+    constexpr int max_transfer_plans = 16;
+    constexpr int max_pose_candidates = 72;
+    const int max_poses_per_height =
+        std::max(1, (max_pose_candidates + static_cast<int>(heights.size()) - 1) /
+                        static_cast<int>(heights.size()));
+    const int max_transfers_per_height =
+        std::max(1, (max_transfer_plans + static_cast<int>(heights.size()) - 1) /
+                        static_cast<int>(heights.size()));
+    // Interleave tilt and roll values so the bounded search samples multiple
+    // orientations before spending its pose budget on one orientation family.
+    const std::array<std::pair<double, int>, 12> orientations{{
+        {60.0, 0}, {45.0, 0}, {30.0, 0},
+        {60.0, 90}, {45.0, 90}, {30.0, 90},
+        {60.0, 180}, {45.0, 180}, {30.0, 180},
+        {60.0, 270}, {45.0, 270}, {30.0, 270}}};
+
+    for (double height : heights) {
+      if (stats.transfers >= max_transfer_plans || stats.poses >= max_pose_candidates) break;
+      const int transfers_at_height = stats.transfers;
+      const int poses_at_height = stats.poses;
+      for (const auto& orientation : orientations) {
+        if (stats.transfers - transfers_at_height >= max_transfers_per_height ||
+            stats.transfers >= max_transfer_plans ||
+            stats.poses - poses_at_height >= max_poses_per_height ||
+            stats.poses >= max_pose_candidates)
+          break;
+        const double tilt_deg = orientation.first;
+        const int roll_deg = orientation.second;
+        for (const auto& direction : directions) {
+          if (stats.transfers - transfers_at_height >= max_transfers_per_height ||
+              stats.transfers >= max_transfer_plans ||
+              stats.poses - poses_at_height >= max_poses_per_height ||
+              stats.poses >= max_pose_candidates)
+            break;
+          const double angle = tilt_deg * M_PI / 180.0;
+          std::vector<Transform> contact_path;
+          contact_path.reserve(contact_points.size());
+          for (const auto& point : contact_points) {
+            Eigen::Vector3d horizontal;
+            if (circular_seam) {
+              // The iron handle stays outside the round body; its tip axis
+              // points from that outer side into the joint line.
+              horizontal = seam_center - point;
+              horizontal -= normal * horizontal.dot(normal);
+              if (horizontal.norm() < 1e-9) continue;
+              horizontal.normalize();
+            } else {
+              horizontal = (board.linear() * direction).normalized();
+            }
+            const Eigen::Vector3d across = normal.cross(horizontal).normalized();
+            const Eigen::Vector3d axis =
+                horizontal * std::sin(angle) - normal * std::cos(angle);
+            Transform tip = Transform::Identity();
+            tip.linear().col(0) = axis;
+            tip.linear().col(1) = across;
+            tip.linear().col(2) = axis.cross(across);
+            tip.translation() = point;
+            tip.linear() = tip.linear() *
+                Eigen::AngleAxisd(roll_deg * M_PI / 180.0, Eigen::Vector3d::UnitX()).toRotationMatrix();
+            contact_path.push_back(tip * hand_to_tip.inverse());
+          }
+          if (contact_path.size() != contact_points.size()) continue;
+          Transform above = contact_path.front();
+          above.translation() += normal * height;
+          planPadApproach(group, scene, above, contact_path, candidates, stats,
+                          direction, tilt_deg, roll_deg, height);
+        }
+      }
+    }
+
+    RCLCPP_INFO(node_->get_logger(),
+                "SOLDER PAD SEARCH poses=%d IK=%d collision_free=%d descents=%d route_attempts=%d candidates=%zu",
+                stats.poses, stats.ik, stats.collision_free, stats.descents,
+                stats.transfers, candidates.size());
+    if (candidates.empty())
+      throw std::runtime_error("No complete solder approach/contact plan; see SOLDER PAD SEARCH");
+
+    scoreCandidates(candidates);
+    std::stable_sort(candidates.begin(), candidates.end(),
+                     [](const auto& a, const auto& b) {
+                       constexpr double tcp_tie_tolerance = 0.005;  // 5 mm
+                       if (std::abs(a.tcp_length - b.tcp_length) > tcp_tie_tolerance)
+                         return a.tcp_length < b.tcp_length;
+                       return a.score < b.score;
+                     });
+    const std::size_t report_count = std::min<std::size_t>(3, candidates.size());
+    for (std::size_t i = 0; i < report_count; ++i) {
+      const auto& option = candidates[i];
+      RCLCPP_INFO(node_->get_logger(),
+                  "SOLDER PAD OPTION rank=%zu score=%.4f tcp_length=%.3f joint_length=%.3f duration=%.3f smoothness=%.3f planner=%s tilt=%.0f roll=%d clearance=%.3f direction=(%.3f %.3f)",
+                  i + 1, option.score, option.tcp_length, option.joint_length, option.duration,
+                  option.smoothness, option.planner.c_str(),
+                  option.tilt_deg, option.roll_deg,
+                  option.clearance, option.direction.x(), option.direction.y());
+    }
+
+    const auto& best = candidates.front();
+    const Transform above = best.above;
+    RCLCPP_INFO(node_->get_logger(),
+                "SOLDER %s SELECTED planner=%s tcp_length=%.3f score=%.4f tilt=%.0f roll=%d clearance=%.3f",
+                circular_seam ? "CIRCULAR_SEAM" : "PAD",
+                best.planner.c_str(), best.tcp_length, best.score,
+                best.tilt_deg, best.roll_deg, best.clearance);
+    status(circular_seam
+               ? "APPROACH_CIRCULAR_SEAM " + std::to_string(component)
+               : "APPROACH_PAD " + std::to_string(component) + ":" + std::to_string(pad + 1));
+    run(group, best.transfer);
+    run(group, best.descent);
+    status(circular_seam
+               ? "DWELL_CIRCULAR_SEAM " + std::to_string(component)
+               : "DWELL_PAD " + std::to_string(component) + ":" + std::to_string(pad + 1));
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::duration<double>(dwell_);
     while (std::chrono::steady_clock::now() < deadline) {
       if (!rclcpp::ok()) throw std::runtime_error("Solder dwell interrupted");
       rclcpp::sleep_for(50ms);
     }
     cartesian(group, above);
-    markPad(component, pad, pad_position);
+    seam_contacts.restore();
+    if (circular_seam) markSeam(component, contact_points);
+    else markPad(component, pad, contact_points.front());
   }
 
   void markPad(int component, std::size_t pad, const Eigen::Vector3d& at)
@@ -811,6 +1411,32 @@ private:
     marker_pub_->publish(marks_);
   }
 
+  void markSeam(int component, const std::vector<Eigen::Vector3d>& points)
+  {
+    visualization_msgs::msg::Marker m;
+    m.header.frame_id = "world";
+    m.header.stamp = node_->now();
+    m.ns = "soldered_seams";
+    m.id = component;
+    m.type = visualization_msgs::msg::Marker::LINE_STRIP;
+    m.action = visualization_msgs::msg::Marker::ADD;
+    m.pose.orientation.w = 1.0;
+    m.scale.x = 0.003;
+    m.color.r = 1.0f;
+    m.color.g = 0.55f;
+    m.color.b = 0.05f;
+    m.color.a = 1.0f;
+    for (const auto& point : points) {
+      geometry_msgs::msg::Point marker_point;
+      marker_point.x = point.x();
+      marker_point.y = point.y();
+      marker_point.z = point.z();
+      m.points.push_back(marker_point);
+    }
+    marks_.markers.push_back(std::move(m));
+    marker_pub_->publish(marks_);
+  }
+
   void status(const std::string& text)
   {
     std_msgs::msg::String msg; msg.data = text; status_pub_->publish(msg);
@@ -822,6 +1448,12 @@ private:
   Scene scene_;
   rclcpp::Client<moveit_msgs::srv::GetPlanningScene>::SharedPtr scene_client_;
   std::string last_plan_error_;
+  std::vector<std::string> planner_trials_;
+  std::map<std::string, std::set<std::string>> available_planners_;
+  std::map<std::string, std::string> available_pipeline_plugins_;
+  std::set<std::string> warned_unavailable_planners_;
+  bool planner_catalog_available_ = false;
+  double planner_timeout_seconds_ = 1.5;
   double dwell_ = 1.5, clearance_ = 0.06;
   std::set<int> completed_;
   visualization_msgs::msg::MarkerArray marks_;
