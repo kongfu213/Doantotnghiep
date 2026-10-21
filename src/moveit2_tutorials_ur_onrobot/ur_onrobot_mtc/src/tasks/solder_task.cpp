@@ -919,7 +919,8 @@ private:
                        const Transform& above, const std::vector<Transform>& contact_path,
                        std::vector<PadPlanCandidate>& candidates,
                        PadSearchStats& stats, const Eigen::Vector3d& direction,
-                       double tilt_deg, int roll_deg, double clearance)
+                       double tilt_deg, int roll_deg, double clearance,
+                       bool cartesian_transfer_only)
   {
     // Bound calls across the enabled planner portfolio and retain feasible
     // alternatives instead of stopping at the first plan.
@@ -1000,8 +1001,19 @@ private:
       ++stats.transfers;
       Group::Plan direct_plan;
       moveit::core::RobotState current(scene->getCurrentState());
-      if (planCartesian(group, above, current, direct_plan, false))
-        recordCandidate(std::move(direct_plan), "CARTESIAN_DIRECT");
+      const bool direct_cartesian_found =
+          planCartesian(group, above, current, direct_plan, false);
+      if (direct_cartesian_found) {
+        recordCandidate(
+            std::move(direct_plan),
+            cartesian_transfer_only ? "CARTESIAN_PAD2_TRANSFER" : "CARTESIAN_DIRECT");
+      }
+
+      if (cartesian_transfer_only) {
+        // Pad 2 follows pad 1. Keep this inter-pad transfer Cartesian; do not
+        // substitute a sampling-based planner if the Cartesian path is incomplete.
+        continue;
+      }
 
       // Also ask each configured MoveIt pipeline for an alternative. This
       // portfolio lets the TCP-length ranking compare real planner outputs.
@@ -1264,6 +1276,12 @@ private:
       });
     }
 
+    const bool cartesian_transfer_only = !circular_seam && pad == 1;
+    if (cartesian_transfer_only) {
+      RCLCPP_INFO(node_->get_logger(),
+                  "SOLDER PAD 2 transfer uses Cartesian only; OMPL alternatives disabled");
+    }
+
     std::vector<double> heights;
     for (double height : {0.02, std::min(clearance_, 0.04), clearance_}) {
       const bool duplicate = std::any_of(heights.begin(), heights.end(), [&](double existing) {
@@ -1339,7 +1357,8 @@ private:
           Transform above = contact_path.front();
           above.translation() += normal * height;
           planPadApproach(group, scene, above, contact_path, candidates, stats,
-                          direction, tilt_deg, roll_deg, height);
+                          direction, tilt_deg, roll_deg, height,
+                          cartesian_transfer_only);
         }
       }
     }
