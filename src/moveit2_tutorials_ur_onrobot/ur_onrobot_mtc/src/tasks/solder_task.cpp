@@ -920,7 +920,7 @@ private:
                        std::vector<PadPlanCandidate>& candidates,
                        PadSearchStats& stats, const Eigen::Vector3d& direction,
                        double tilt_deg, int roll_deg, double clearance,
-                       bool cartesian_transfer_only)
+                       bool rrt_transfer_only)
   {
     // Bound calls across the enabled planner portfolio and retain feasible
     // alternatives instead of stopping at the first plan.
@@ -997,22 +997,13 @@ private:
         return true;
       };
 
-      // First try a collision-checked straight Cartesian transfer.
-      ++stats.transfers;
-      Group::Plan direct_plan;
-      moveit::core::RobotState current(scene->getCurrentState());
-      const bool direct_cartesian_found =
-          planCartesian(group, above, current, direct_plan, false);
-      if (direct_cartesian_found) {
-        recordCandidate(
-            std::move(direct_plan),
-            cartesian_transfer_only ? "CARTESIAN_PAD2_TRANSFER" : "CARTESIAN_DIRECT");
-      }
-
-      if (cartesian_transfer_only) {
-        // Pad 2 follows pad 1. Keep this inter-pad transfer Cartesian; do not
-        // substitute a sampling-based planner if the Cartesian path is incomplete.
-        continue;
+      if (!rrt_transfer_only) {
+        // For ordinary approaches, include a collision-checked straight Cartesian transfer.
+        ++stats.transfers;
+        Group::Plan direct_plan;
+        moveit::core::RobotState current(scene->getCurrentState());
+        if (planCartesian(group, above, current, direct_plan, false))
+          recordCandidate(std::move(direct_plan), "CARTESIAN_DIRECT");
       }
 
       // Also ask each configured MoveIt pipeline for an alternative. This
@@ -1025,6 +1016,17 @@ private:
       for (const auto& raw_trial : planner_trials_) {
         if (stats.transfers >= max_transfer_plans) break;
         const PlannerTrial trial = parsePlannerTrial(raw_trial);
+        if (rrt_transfer_only) {
+          std::string planner_id_lower = trial.planner_id;
+          std::transform(planner_id_lower.begin(), planner_id_lower.end(), planner_id_lower.begin(),
+                         [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+          if (planner_id_lower.find("rrtconnect") == std::string::npos) {
+            RCLCPP_WARN(node_->get_logger(),
+                        "SOLDER PAD 2 requires RRTConnect; skipping planner=%s",
+                        raw_trial.c_str());
+            continue;
+          }
+        }
         const std::string planner_name = trial.pipeline + ":" +
             (trial.planner_id.empty() ? std::string("default") : trial.planner_id);
         if (!plannerTrialAvailable(trial)) {
@@ -1276,10 +1278,10 @@ private:
       });
     }
 
-    const bool cartesian_transfer_only = !circular_seam && pad == 1;
-    if (cartesian_transfer_only) {
+    const bool rrt_transfer_only = !circular_seam && pad == 1;
+    if (rrt_transfer_only) {
       RCLCPP_INFO(node_->get_logger(),
-                  "SOLDER PAD 2 transfer uses Cartesian only; OMPL alternatives disabled");
+                  "SOLDER PAD 2 transfer requires RRTConnect; Cartesian transfer disabled");
     }
 
     std::vector<double> heights;
@@ -1358,7 +1360,7 @@ private:
           above.translation() += normal * height;
           planPadApproach(group, scene, above, contact_path, candidates, stats,
                           direction, tilt_deg, roll_deg, height,
-                          cartesian_transfer_only);
+                          rrt_transfer_only);
         }
       }
     }
