@@ -87,26 +87,46 @@ def launch_setup(context, *args, **kwargs):
         )
     }
 
-    robot_description_planning = {
-        "robot_description_planning": load_yaml(
-            str(moveit_config_package.perform(context)),
-            os.path.join("config", str(moveit_joint_limits_file.perform(context))),
-        )
-    }
+    moveit_config_name = str(moveit_config_package.perform(context))
+    planning_limits = load_yaml(
+        moveit_config_name,
+        os.path.join("config", str(moveit_joint_limits_file.perform(context))),
+    ) or {}
+    pilz_limits = load_yaml(moveit_config_name, "config/pilz_cartesian_limits.yaml") or {}
+    planning_limits["cartesian_limits"] = pilz_limits.get(
+        "cartesian_limits", pilz_limits.get("pilz_cartesian_limits", {})
+    )
+    robot_description_planning = {"robot_description_planning": planning_limits}
 
-    # 4. OMPL Planning Pipeline
-    ompl_planning_pipeline_config = {
-        "move_group": {
+    # The sequence service uses move_group's default pipeline on Humble.
+    # Keep Pilz as the server default for LIN/CIRC sequences; clients select
+    # OMPL explicitly for free-space RRTConnect plans.
+    planning_pipeline_config = {
+        "planning_pipelines": ["ompl", "pilz_industrial_motion_planner"],
+        "default_planning_pipeline": "pilz_industrial_motion_planner",
+        "ompl": {
             "planning_plugin": "ompl_interface/OMPLPlanner",
-            "request_adapters": """default_planner_request_adapters/AddTimeOptimalParameterization default_planner_request_adapters/FixWorkspaceBounds default_planner_request_adapters/FixStartStateBounds default_planner_request_adapters/FixStartStateCollision default_planner_request_adapters/FixStartStatePathConstraints""",
+            "request_adapters": (
+                "default_planner_request_adapters/AddTimeOptimalParameterization "
+                "default_planner_request_adapters/FixWorkspaceBounds "
+                "default_planner_request_adapters/FixStartStateBounds "
+                "default_planner_request_adapters/FixStartStateCollision "
+                "default_planner_request_adapters/FixStartStatePathConstraints "
+                "default_planner_request_adapters/AddRuckigTrajectorySmoothing"
+            ),
             "start_state_max_bounds_error": 0.1,
-        }
+        },
+        "pilz_industrial_motion_planner": {
+            "planning_plugin": "pilz_industrial_motion_planner/CommandPlanner",
+            "request_adapters": "",
+            "default_planner_config": "PTP",
+        },
     }
-    ompl_planning_yaml = load_yaml("ur_onrobot_moveit_config", "config/ompl_planning.yaml")
-    ompl_planning_pipeline_config["move_group"].update(ompl_planning_yaml)
+    ompl_planning_yaml = load_yaml(moveit_config_name, "config/ompl_planning.yaml") or {}
+    planning_pipeline_config["ompl"].update(ompl_planning_yaml)
 
     # 5. MoveIt Controllers
-    controllers_yaml = load_yaml("ur_onrobot_moveit_config", "config/controllers.yaml")
+    controllers_yaml = load_yaml(moveit_config_name, "config/controllers.yaml")
     
     moveit_controllers = {
         "moveit_simple_controller_manager": controllers_yaml,
@@ -187,13 +207,15 @@ def launch_setup(context, *args, **kwargs):
             publish_robot_description_semantic,
             robot_description_kinematics,
             robot_description_planning,
-            ompl_planning_pipeline_config,
+            planning_pipeline_config,
             trajectory_execution,
             moveit_controllers,
             planning_scene_monitor_parameters,
             {"use_sim_time": use_sim_time},
             warehouse_ros_config,
-            {"capabilities": "move_group/ExecuteTaskSolutionCapability"}
+            {"capabilities": "move_group/ExecuteTaskSolutionCapability "
+                              "pilz_industrial_motion_planner/MoveGroupSequenceAction "
+                              "pilz_industrial_motion_planner/MoveGroupSequenceService"}
         ],
     )
 
@@ -211,7 +233,7 @@ def launch_setup(context, *args, **kwargs):
         parameters=[
             robot_description,
             robot_description_semantic,
-            ompl_planning_pipeline_config,
+            planning_pipeline_config,
             robot_description_kinematics,
             robot_description_planning,
             warehouse_ros_config,
@@ -262,5 +284,4 @@ def generate_launch_description():
     
     declared_arguments.append(DeclareLaunchArgument("launch_rviz", default_value="true", description="Launch RViz?"))
     declared_arguments.append(DeclareLaunchArgument("launch_servo", default_value="false", description="Launch Servo?"))
-
     return LaunchDescription(declared_arguments + [OpaqueFunction(function=launch_setup)])

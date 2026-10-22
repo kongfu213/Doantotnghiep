@@ -1,18 +1,24 @@
 #include "ur_onrobot_mtc/tasks/solder_task.hpp"
 #include "ur_onrobot_mtc/pcb_geometry.hpp"
 
-// RRTConnect plans free-space transfers; Cartesian interpolation follows each
-// derived rectangular pad edge and performs the contact/descent stroke.
+// RRTConnect plans free-space transfers. Pilz LIN follows straight pad seams;
+// four Pilz CIRC commands close each circular solder seam.
 
 #include <Eigen/Geometry>
 #include <moveit/move_group_interface/move_group_interface.h>
+#include <moveit/kinematic_constraints/utils.h>
 #include <moveit/planning_scene_interface/planning_scene_interface.h>
 #include <moveit/planning_scene/planning_scene.h>
 #include <moveit/collision_detection/collision_matrix.h>
 #include <moveit/robot_trajectory/robot_trajectory.h>
 #include <moveit/robot_state/conversions.h>
 #include <moveit/trajectory_processing/iterative_time_parameterization.h>
+#include <moveit/trajectory_processing/ruckig_traj_smoothing.h>
 #include <moveit_msgs/srv/get_planning_scene.hpp>
+#include <moveit_msgs/srv/get_motion_sequence.hpp>
+#include <moveit_msgs/msg/motion_sequence_item.hpp>
+#include <moveit_msgs/msg/motion_sequence_request.hpp>
+#include <geometry_msgs/msg/pose_stamped.hpp>
 #include <moveit_msgs/msg/planning_scene_components.hpp>
 #include <moveit_msgs/msg/planner_interface_description.hpp>
 #include <geometry_msgs/msg/point.hpp>
@@ -142,6 +148,7 @@ public:
   explicit Impl(std::shared_ptr<DualArmInterface> robot) : robot_(std::move(robot)), node_(robot_->node())
   {
     scene_client_ = node_->create_client<moveit_msgs::srv::GetPlanningScene>("/get_planning_scene");
+    sequence_client_ = node_->create_client<moveit_msgs::srv::GetMotionSequence>("/plan_sequence_path");
     if (!node_->has_parameter("solder.holder_arm")) node_->declare_parameter<std::string>("solder.holder_arm", "left");
     if (!node_->has_parameter("solder.dwell_seconds")) node_->declare_parameter<double>("solder.dwell_seconds", 1.5);
     if (!node_->has_parameter("solder.approach_height")) node_->declare_parameter<double>("solder.approach_height", 0.06);
@@ -162,6 +169,8 @@ public:
     try {
       if (component < 0 || component > 3) throw std::runtime_error("Use solder [1|2|3|all]");
       if (!robot_->executeEnabled()) throw std::runtime_error("SOLDER needs execute:=true on fake hardware");
+      if (!sequence_client_->wait_for_service(5s))
+        throw std::runtime_error("Pilz sequence service /plan_sequence_path unavailable; start the dual MoveIt launch with Pilz enabled");
       const ArmSide holder = DualArmInterface::parseArmSide(node_->get_parameter("solder.holder_arm").as_string());
       if (holder != ArmSide::LEFT && holder != ArmSide::RIGHT) throw std::runtime_error("Invalid solder.holder_arm");
       const ArmSide solderer = holder == ArmSide::LEFT ? ArmSide::RIGHT : ArmSide::LEFT;
@@ -334,6 +343,8 @@ private:
   void configure(Group& group, ArmSide arm)
   {
     group.setEndEffectorLink(prefix(arm) + "gripper_tcp");
+    // Keep free-space motion on OMPL; move_group defaults to Pilz for sequences.
+    group.setPlanningPipelineId("ompl");
     group.setPoseReferenceFrame("world");
     group.setPlannerId("RRTConnectkConfigDefault");
     group.setPlanningTime(8.0);
@@ -598,7 +609,9 @@ private:
     robot_trajectory::RobotTrajectory trajectory(group.getRobotModel(), group.getName());
     trajectory.setRobotTrajectoryMsg(start, message);
     trajectory_processing::IterativeParabolicTimeParameterization timing;
-    if (!timing.computeTimeStamps(trajectory, 0.10, 0.10)) return false;
+    if (!timing.computeTimeStamps(trajectory, 0.10, 0.10) ||
+        !trajectory_processing::RuckigSmoothing::applySmoothing(trajectory, 0.10, 0.10))
+      return false;
     moveit::core::robotStateToRobotStateMsg(start, result.start_state_);
     trajectory.getRobotTrajectoryMsg(result.trajectory_);
     return true;
@@ -609,6 +622,111 @@ private:
                      bool log_incomplete = true)
   {
     return planCartesian(group, std::vector<Transform>{target}, start, result, log_incomplete);
+  }
+
+  bool planPilzSolderSequence(Group& group, const std::vector<Transform>& contact_path,
+                              const moveit::core::RobotState& start,
+                              bool circular_seam, Group::Plan& result)
+  {
+    if (contact_path.size() < 2 || !sequence_client_->wait_for_service(1s))
+      return false;
+
+    constexpr double blend_radius = 0.0005;  // 0.5 mm blend for continuous, low-deviation joins
+    moveit_msgs::msg::MotionSequenceRequest sequence;
+    const auto append_item = [&](const std::string& planner_id, const Transform& target,
+                                 double blend, const moveit::core::RobotState* start_state,
+                                 const Transform* interim) {
+      moveit_msgs::msg::MotionSequenceItem item;
+      item.blend_radius = blend;
+      item.req.pipeline_id = "pilz_industrial_motion_planner";
+      item.req.planner_id = planner_id;
+      item.req.group_name = group.getName();
+      item.req.allowed_planning_time = planner_timeout_seconds_;
+      item.req.max_velocity_scaling_factor = 0.10;
+      item.req.max_acceleration_scaling_factor = 0.10;
+
+      geometry_msgs::msg::PoseStamped target_pose;
+      target_pose.header.frame_id = "world";
+      target_pose.header.stamp = node_->now();
+      target_pose.pose = pose(target);
+      item.req.goal_constraints.push_back(
+          kinematic_constraints::constructGoalConstraints(group.getEndEffectorLink(), target_pose));
+
+      if (start_state)
+        moveit::core::robotStateToRobotStateMsg(*start_state, item.req.start_state);
+
+      if (interim) {
+        moveit_msgs::msg::PositionConstraint position;
+        position.header.frame_id = "world";
+        position.link_name = group.getEndEffectorLink();
+        position.constraint_region.primitive_poses.push_back(pose(*interim));
+        position.weight = 1.0;
+        item.req.path_constraints.name = "interim";
+        item.req.path_constraints.position_constraints.push_back(std::move(position));
+      }
+      sequence.items.push_back(std::move(item));
+    };
+
+    // Enter the seam with LIN, then follow its centerline.
+    append_item("LIN", contact_path.front(), blend_radius, &start, nullptr);
+
+    if (!circular_seam) {
+      append_item("LIN", contact_path.back(), 0.0, nullptr, nullptr);
+    } else {
+      // CIRC cannot cover a full circle in one command. Four quarter arcs use
+      // exact interim poses from the scene-derived circle and close the loop.
+      constexpr std::size_t arc_count = 4;
+      const std::size_t intervals = contact_path.size() - 1;
+      if (intervals % arc_count != 0 || (intervals / arc_count) % 2 != 0)
+        return false;
+      const std::size_t points_per_arc = intervals / arc_count;
+      for (std::size_t arc = 0; arc < arc_count; ++arc) {
+        const std::size_t start_index = arc * points_per_arc;
+        const std::size_t interim_index = start_index + points_per_arc / 2;
+        const std::size_t goal_index = start_index + points_per_arc;
+        const double blend = arc + 1 == arc_count ? 0.0 : blend_radius;
+        append_item("CIRC", contact_path[goal_index], blend, nullptr,
+                    &contact_path[interim_index]);
+      }
+    }
+
+    auto request = std::make_shared<moveit_msgs::srv::GetMotionSequence::Request>();
+    request->request = std::move(sequence);
+    auto future = sequence_client_->async_send_request(request);
+    const double timeout_seconds =
+        std::max(5.0, planner_timeout_seconds_ * request->request.items.size() + 2.0);
+    if (future.wait_for(std::chrono::duration<double>(timeout_seconds)) != std::future_status::ready) {
+      RCLCPP_WARN(node_->get_logger(), "Timed out planning Pilz solder sequence");
+      return false;
+    }
+
+    const auto response = future.get();
+    if (!response || response->response.error_code.val !=
+                         moveit_msgs::msg::MoveItErrorCodes::SUCCESS ||
+        response->response.planned_trajectories.size() != 1) {
+      const int code = response ? response->response.error_code.val : -1;
+      RCLCPP_WARN(node_->get_logger(),
+                  "Pilz solder sequence failed: group=%s code=%d trajectories=%zu",
+                  group.getName().c_str(), code,
+                  response ? response->response.planned_trajectories.size() : 0);
+      return false;
+    }
+
+    moveit::core::RobotState trajectory_start(group.getRobotModel());
+    moveit::core::robotStateMsgToRobotState(response->response.sequence_start, trajectory_start);
+    robot_trajectory::RobotTrajectory trajectory(group.getRobotModel(), group.getName());
+    trajectory.setRobotTrajectoryMsg(trajectory_start,
+                                     response->response.planned_trajectories.front());
+    if (trajectory.getWayPointCount() < 2 ||
+        !trajectory_processing::RuckigSmoothing::applySmoothing(trajectory, 0.10, 0.10))
+      return false;
+
+    moveit::core::robotStateToRobotStateMsg(trajectory_start, result.start_state_);
+    trajectory.getRobotTrajectoryMsg(result.trajectory_);
+    RCLCPP_INFO(node_->get_logger(),
+                "SOLDER native Pilz sequence planned: mode=%s segments=%zu blend_radius=%.4f",
+                circular_seam ? "LIN+CIRC" : "LIN", request->request.items.size(), blend_radius);
+    return !result.trajectory_.joint_trajectory.points.empty();
   }
 
   bool tryCartesian(Group& group, const Transform& target, double& fraction)
@@ -624,7 +742,8 @@ private:
     robot_trajectory::RobotTrajectory trajectory(group.getRobotModel(), group.getName());
     trajectory.setRobotTrajectoryMsg(*start, message);
     trajectory_processing::IterativeParabolicTimeParameterization timing;
-    if (!timing.computeTimeStamps(trajectory, 0.10, 0.10))
+    if (!timing.computeTimeStamps(trajectory, 0.10, 0.10) ||
+        !trajectory_processing::RuckigSmoothing::applySmoothing(trajectory, 0.10, 0.10))
       return false;
     Group::Plan result;
     trajectory.getRobotTrajectoryMsg(result.trajectory_);
@@ -677,7 +796,7 @@ private:
     Transform above;
     Transform contact;
     Group::Plan transfer;
-    Group::Plan descent;
+    Group::Plan solder_motion;
     Eigen::Vector3d direction = Eigen::Vector3d::Zero();
     double clearance = 0.0;
     double tilt_deg = 0.0;
@@ -920,7 +1039,7 @@ private:
                        std::vector<PadPlanCandidate>& candidates,
                        PadSearchStats& stats, const Eigen::Vector3d& direction,
                        double tilt_deg, int roll_deg, double clearance,
-                       bool rrt_transfer_only)
+                       bool rrt_transfer_only, bool circular_seam)
   {
     // Bound calls across the enabled planner portfolio and retain feasible
     // alternatives instead of stopping at the first plan.
@@ -959,15 +1078,16 @@ private:
         robot_trajectory::RobotTrajectory transfer(group.getRobotModel(), group.getName());
         transfer.setRobotTrajectoryMsg(start, approach_plan.trajectory_);
         if (!transfer.getWayPointCount()) return false;
-        Group::Plan verified_contact;
-        if (!planCartesian(group, contact_path, transfer.getLastWayPoint(), verified_contact))
+        Group::Plan solder_motion;
+        if (!planPilzSolderSequence(group, contact_path, transfer.getLastWayPoint(),
+                                    circular_seam, solder_motion))
           return false;
 
         PadPlanCandidate option;
         option.above = above;
         option.contact = contact_path.front();
         option.transfer = std::move(approach_plan);
-        option.descent = std::move(verified_contact);
+        option.solder_motion = std::move(solder_motion);
         option.direction = direction;
         option.clearance = clearance;
         option.tilt_deg = tilt_deg;
@@ -977,13 +1097,13 @@ private:
         const std::string end_effector = group.getEndEffectorLink();
         option.tcp_length =
             trajectoryTcpLength(option.transfer, model, group.getName(), end_effector) +
-            trajectoryTcpLength(option.descent, model, group.getName(), end_effector);
+            trajectoryTcpLength(option.solder_motion, model, group.getName(), end_effector);
         option.joint_length =
-            trajectoryJointLength(option.transfer) + trajectoryJointLength(option.descent);
+            trajectoryJointLength(option.transfer) + trajectoryJointLength(option.solder_motion);
         option.duration =
-            trajectoryDuration(option.transfer) + trajectoryDuration(option.descent);
+            trajectoryDuration(option.transfer) + trajectoryDuration(option.solder_motion);
         option.smoothness =
-            trajectorySmoothness(option.transfer) + trajectorySmoothness(option.descent);
+            trajectorySmoothness(option.transfer) + trajectorySmoothness(option.solder_motion);
         if (!std::isfinite(option.tcp_length) || !std::isfinite(option.joint_length) ||
             !std::isfinite(option.duration) || !std::isfinite(option.smoothness)) {
           RCLCPP_WARN(node_->get_logger(),
@@ -1360,7 +1480,7 @@ private:
           above.translation() += normal * height;
           planPadApproach(group, scene, above, contact_path, candidates, stats,
                           direction, tilt_deg, roll_deg, height,
-                          rrt_transfer_only);
+                          rrt_transfer_only, circular_seam);
         }
       }
     }
@@ -1402,7 +1522,10 @@ private:
                ? "APPROACH_CIRCULAR_SEAM " + std::to_string(component)
                : "APPROACH_PAD " + std::to_string(component) + ":" + std::to_string(pad + 1));
     run(group, best.transfer);
-    run(group, best.descent);
+    status(circular_seam
+               ? "MOVE_CIRC_SEAM " + std::to_string(component)
+               : "MOVE_LIN_PAD " + std::to_string(component) + ":" + std::to_string(pad + 1));
+    run(group, best.solder_motion);
     status(circular_seam
                ? "DWELL_CIRCULAR_SEAM " + std::to_string(component)
                : "DWELL_PAD " + std::to_string(component) + ":" + std::to_string(pad + 1));
@@ -1411,7 +1534,10 @@ private:
       if (!rclcpp::ok()) throw std::runtime_error("Solder dwell interrupted");
       rclcpp::sleep_for(50ms);
     }
-    cartesian(group, above);
+    Transform retract = above;
+    if (!circular_seam)
+      retract.translation() += contact_points.back() - contact_points.front();
+    cartesian(group, retract);
     seam_contacts.restore();
     if (circular_seam) markSeam(component, contact_points);
     else markPad(component, pad, contact_points.front());
@@ -1468,6 +1594,7 @@ private:
   rclcpp::Node::SharedPtr node_;
   Scene scene_;
   rclcpp::Client<moveit_msgs::srv::GetPlanningScene>::SharedPtr scene_client_;
+  rclcpp::Client<moveit_msgs::srv::GetMotionSequence>::SharedPtr sequence_client_;
   std::string last_plan_error_;
   std::vector<std::string> planner_trials_;
   std::map<std::string, std::set<std::string>> available_planners_;
@@ -1486,4 +1613,5 @@ SolderTask::SolderTask(std::shared_ptr<DualArmInterface> robot)
   : TaskBase(robot), impl_(std::make_unique<Impl>(std::move(robot))) {}
 SolderTask::~SolderTask() = default;
 bool SolderTask::execute(int component) { return impl_->execute(component); }
+
 }  // namespace ur_onrobot_mtc

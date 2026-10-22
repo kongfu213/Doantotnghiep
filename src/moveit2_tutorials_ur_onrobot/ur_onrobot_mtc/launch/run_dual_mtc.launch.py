@@ -1,5 +1,7 @@
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, OpaqueFunction
+import math
+
 from launch.substitutions import Command, FindExecutable, LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
@@ -85,6 +87,27 @@ def launch_setup(context, *args, **kwargs):
     joint_limits_yaml = load_yaml(
         "ur_onrobot_moveit_config", "config/joint_limits.yaml"
     ) or {}
+
+    # Ruckig needs explicit jerk bounds; use one configurable limit for every
+    # revolute joint on both arms in this simulation.
+    max_joint_jerk = float(LaunchConfiguration("max_joint_jerk").perform(context))
+    if not math.isfinite(max_joint_jerk) or max_joint_jerk <= 0.0:
+        raise RuntimeError("max_joint_jerk must be a finite positive value in rad/s^3")
+    joint_limits = joint_limits_yaml.setdefault("joint_limits", {})
+    arm_joint_names = (
+        "shoulder_pan_joint",
+        "shoulder_lift_joint",
+        "elbow_joint",
+        "wrist_1_joint",
+        "wrist_2_joint",
+        "wrist_3_joint",
+    )
+    for arm in ("left", "right"):
+        for joint_name in arm_joint_names:
+            limits = joint_limits.setdefault(f"{arm}_{joint_name}", {})
+            limits["has_jerk_limits"] = True
+            limits["max_jerk"] = max_joint_jerk
+
     robot_description_planning = {
         "robot_description_planning": joint_limits_yaml
     }
@@ -108,6 +131,14 @@ def launch_setup(context, *args, **kwargs):
     ompl_yaml = load_yaml("ur_onrobot_moveit_config", "config/ompl_planning.yaml")
     if ompl_yaml:
         ompl_config["ompl"].update(ompl_yaml)
+
+    # In the MoveIt request-adapter chain, the first entry runs last on the
+    # trajectory, after time parameterization has assigned timestamps.
+    ruckig_adapter = "default_planner_request_adapters/AddRuckigTrajectorySmoothing"
+    adapters = ompl_config["ompl"].get("request_adapters", "").split()
+    adapters = [adapter for adapter in adapters if adapter != ruckig_adapter]
+    adapters.insert(0, ruckig_adapter)
+    ompl_config["ompl"]["request_adapters"] = " ".join(adapters)
 
     # IMPORTANT:
     # No stack_center_x/y, no A/B/C/D task poses, no left/right place target,
@@ -186,5 +217,10 @@ def generate_launch_description():
         DeclareLaunchArgument("holder_arm", default_value="left", choices=["left", "right"]),
         DeclareLaunchArgument("dwell_seconds", default_value="1.5"),
         DeclareLaunchArgument("approach_height", default_value="0.06"),
+        DeclareLaunchArgument(
+            "max_joint_jerk",
+            default_value="20.0",
+            description="Maximum joint jerk for Ruckig smoothing in rad/s^3",
+        ),
         OpaqueFunction(function=launch_setup),
     ])
