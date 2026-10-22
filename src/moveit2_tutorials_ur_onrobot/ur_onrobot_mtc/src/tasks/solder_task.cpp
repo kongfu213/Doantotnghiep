@@ -1536,7 +1536,7 @@ private:
     }
     Transform retract = above;
     if (!circular_seam)
-      retract.translation() += contact_path.back().translation() - contact_path.front().translation();
+      retract.translation() += contact_points.back() - contact_points.front();
     cartesian(group, retract);
     seam_contacts.restore();
     if (circular_seam) markSeam(component, contact_points);
