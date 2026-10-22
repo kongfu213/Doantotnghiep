@@ -12,6 +12,7 @@
 #include <moveit/robot_trajectory/robot_trajectory.h>
 #include <moveit/robot_state/conversions.h>
 #include <moveit/trajectory_processing/iterative_time_parameterization.h>
+#include <moveit/trajectory_processing/ruckig_traj_smoothing.h>
 #include <moveit_msgs/srv/get_planning_scene.hpp>
 #include <moveit_msgs/msg/planning_scene_components.hpp>
 #include <moveit_msgs/msg/planner_interface_description.hpp>
@@ -598,7 +599,9 @@ private:
     robot_trajectory::RobotTrajectory trajectory(group.getRobotModel(), group.getName());
     trajectory.setRobotTrajectoryMsg(start, message);
     trajectory_processing::IterativeParabolicTimeParameterization timing;
-    if (!timing.computeTimeStamps(trajectory, 0.10, 0.10)) return false;
+    if (!timing.computeTimeStamps(trajectory, 0.10, 0.10) ||
+        !trajectory_processing::RuckigSmoothing::applySmoothing(trajectory, 0.10, 0.10))
+      return false;
     moveit::core::robotStateToRobotStateMsg(start, result.start_state_);
     trajectory.getRobotTrajectoryMsg(result.trajectory_);
     return true;
@@ -624,7 +627,8 @@ private:
     robot_trajectory::RobotTrajectory trajectory(group.getRobotModel(), group.getName());
     trajectory.setRobotTrajectoryMsg(*start, message);
     trajectory_processing::IterativeParabolicTimeParameterization timing;
-    if (!timing.computeTimeStamps(trajectory, 0.10, 0.10))
+    if (!timing.computeTimeStamps(trajectory, 0.10, 0.10) ||
+        !trajectory_processing::RuckigSmoothing::applySmoothing(trajectory, 0.10, 0.10))
       return false;
     Group::Plan result;
     trajectory.getRobotTrajectoryMsg(result.trajectory_);
