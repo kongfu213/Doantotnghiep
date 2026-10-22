@@ -1613,3 +1613,5 @@ SolderTask::SolderTask(std::shared_ptr<DualArmInterface> robot)
   : TaskBase(robot), impl_(std::make_unique<Impl>(std::move(robot))) {}
 SolderTask::~SolderTask() = default;
 bool SolderTask::execute(int component) { return impl_->execute(component); }
+
+}  // namespace ur_onrobot_mtc
