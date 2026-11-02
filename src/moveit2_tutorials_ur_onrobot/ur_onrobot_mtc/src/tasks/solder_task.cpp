@@ -225,7 +225,7 @@ public:
       // picks and positions the component. Keep the iron attached; the pad
       // planner will approach it from this clear staging pose afterward.
       Transform tool_standby = tool_source;
-      tool_standby.translation() += Eigen::Vector3d(0.0, -0.12, 0.05);
+      tool_standby.translation() += Eigen::Vector3d(0.0, -0.0, 0.05);
       status("MOVE_TOOL_CLEAR");
       move(tool_group, tool_standby * hand_to_tool.inverse());
 
@@ -895,6 +895,7 @@ private:
       return span > 1e-9 ? (value - range.first) / span : 0.0;
     };
 
+    const auto tcp_length_range = range_for([](const auto& c) { return c.tcp_length; });
     const auto joint_length_range = range_for([](const auto& c) { return c.joint_length; });
     const auto duration_range = range_for([](const auto& c) { return c.duration; });
     const auto smoothness_range = range_for([](const auto& c) { return c.smoothness; });
@@ -905,16 +906,17 @@ private:
       // is a geometric proxy, not an exact minimum-distance measurement.
       const double clearance_preference =
           1.0 - normalized(candidate.clearance, clearance_range);
-      // TCP path length is the primary objective and is compared directly
-      // when ranking candidates. These metrics only break near-equal-length ties.
+      // Rank all feasible candidates using the weighted normalized objective.
+      // Lower scores indicate a preferred trade-off among the path metrics.
       candidate.score =
-          0.50 * normalized(candidate.joint_length, joint_length_range) +
-          0.25 * normalized(candidate.duration, duration_range) +
-          0.20 * normalized(candidate.smoothness, smoothness_range) +
-          0.05 * clearance_preference;
-    }
-  }
-
+          0.10 * normalized(candidate.tcp_length, tcp_length_range) +
+          0.10 * normalized(candidate.joint_length, joint_length_range) + 
+          0.10 * normalized(candidate.duration, duration_range) +
+          0.70 * normalized(candidate.smoothness, smoothness_range);
+      
+    } 
+  } 
+ 
   void planPadApproach(Group& group, const planning_scene::PlanningScenePtr& scene,
                        const Transform& above, const std::vector<Transform>& contact_path,
                        std::vector<PadPlanCandidate>& candidates,
@@ -924,7 +926,7 @@ private:
   {
     // Bound calls across the enabled planner portfolio and retain feasible
     // alternatives instead of stopping at the first plan.
-    constexpr int max_transfer_plans = 16;
+    constexpr int max_transfer_plans = 72;
     if (stats.transfers >= max_transfer_plans) return;
     ++stats.poses;
     const auto* joints = group.getRobotModel()->getJointModelGroup(group.getName());
@@ -942,10 +944,10 @@ private:
       if (!candidate.satisfiesBounds(joints)) continue;
       if (scene->isStateColliding(candidate, "", false)) {
         if (stats.ik == 1) logContacts(scene, candidate, "PAD APPROACH");
-        continue;
+        continue; 
       }
       ++stats.collision_free;
-
+ 
       // Check the complete descent and solder stroke with the iron attached.
       Group::Plan contact_plan;
       if (!planCartesian(group, contact_path, candidate, contact_plan)) continue;
@@ -1294,8 +1296,8 @@ private:
 
     std::vector<PadPlanCandidate> candidates;
     PadSearchStats stats;
-    constexpr int max_transfer_plans = 16;
-    constexpr int max_pose_candidates = 72;
+    constexpr int max_transfer_plans = 72;
+    constexpr int max_pose_candidates = 269;
     const int max_poses_per_height =
         std::max(1, (max_pose_candidates + static_cast<int>(heights.size()) - 1) /
                         static_cast<int>(heights.size()));
@@ -1375,12 +1377,10 @@ private:
     scoreCandidates(candidates);
     std::stable_sort(candidates.begin(), candidates.end(),
                      [](const auto& a, const auto& b) {
-                       constexpr double tcp_tie_tolerance = 0.005;  // 5 mm
-                       if (std::abs(a.tcp_length - b.tcp_length) > tcp_tie_tolerance)
-                         return a.tcp_length < b.tcp_length;
-                       return a.score < b.score;
+                       if (a.score != b.score) return a.score < b.score;
+                       return a.tcp_length < b.tcp_length;
                      });
-    const std::size_t report_count = std::min<std::size_t>(3, candidates.size());
+    const std::size_t report_count = candidates.size();
     for (std::size_t i = 0; i < report_count; ++i) {
       const auto& option = candidates[i];
       RCLCPP_INFO(node_->get_logger(),
@@ -1393,6 +1393,7 @@ private:
 
     const auto& best = candidates.front();
     const Transform above = best.above;
+    publishSelectedPath(group, best, component, pad, circular_seam);
     RCLCPP_INFO(node_->get_logger(),
                 "SOLDER %s SELECTED planner=%s tcp_length=%.3f score=%.4f tilt=%.0f roll=%d clearance=%.3f",
                 circular_seam ? "CIRCULAR_SEAM" : "PAD",
@@ -1417,6 +1418,86 @@ private:
     else markPad(component, pad, contact_points.front());
   }
 
+  visualization_msgs::msg::Marker planPathMarker(
+      Group& group, const Group::Plan& plan, const std::string& marker_ns, int marker_id,
+      float r, float g, float b, float alpha, double width)
+  {
+    visualization_msgs::msg::Marker marker;
+    marker.header.frame_id = "world";
+    marker.header.stamp = node_->now();
+    marker.ns = marker_ns;
+    marker.id = marker_id;
+    marker.type = visualization_msgs::msg::Marker::LINE_STRIP;
+    marker.action = visualization_msgs::msg::Marker::ADD;
+    marker.pose.orientation.w = 1.0;
+    marker.scale.x = width;
+    marker.color.r = r;
+    marker.color.g = g;
+    marker.color.b = b;
+    marker.color.a = alpha;
+
+    const auto model = group.getRobotModel();
+    moveit::core::RobotState start(model);
+    moveit::core::robotStateMsgToRobotState(plan.start_state_, start);
+    robot_trajectory::RobotTrajectory trajectory(model, group.getName());
+    trajectory.setRobotTrajectoryMsg(start, plan.trajectory_);
+    const std::string& tcp_link = group.getEndEffectorLink();
+    for (std::size_t i = 0; i < trajectory.getWayPointCount(); ++i) {
+      const Eigen::Vector3d position =
+          trajectory.getWayPoint(i).getGlobalLinkTransform(tcp_link).translation();
+      geometry_msgs::msg::Point point;
+      point.x = position.x();
+      point.y = position.y();
+      point.z = position.z();
+      marker.points.push_back(point);
+    }
+    return marker;
+  }
+
+  void publishAllMarkers()
+  {
+    visualization_msgs::msg::MarkerArray output = marks_;
+    output.markers.insert(output.markers.end(), path_marks_.markers.begin(), path_marks_.markers.end());
+    marker_pub_->publish(output);
+  }
+
+  void publishSelectedPath(Group& group, const PadPlanCandidate& selected,
+                           int component, std::size_t pad, bool circular_seam)
+  {
+    const std::string key = "c" + std::to_string(component) +
+        (circular_seam ? "_seam" : "_pad" + std::to_string(pad + 1));
+    const std::string transfer_ns = "solder_selected_" + key + "_transfer";
+    const std::string stroke_ns = "solder_selected_" + key + "_stroke";
+    const std::set<std::string> replaced_namespaces{transfer_ns, stroke_ns};
+
+    // Replace the previous display for this pad. Keep completed weld markers
+    // and selected paths belonging to other pads visible in RViz.
+    visualization_msgs::msg::MarkerArray deletions;
+    std::vector<visualization_msgs::msg::Marker> retained;
+    for (const auto& old_marker : path_marks_.markers) {
+      if (replaced_namespaces.count(old_marker.ns)) {
+        auto deletion = old_marker;
+        deletion.action = visualization_msgs::msg::Marker::DELETE;
+        deletions.markers.push_back(std::move(deletion));
+      } else {
+        retained.push_back(old_marker);
+      }
+    }
+    path_marks_.markers = std::move(retained);
+
+    // Show only the selected trajectory. Green is the free-space transfer;
+    // orange is the descent and complete solder stroke.
+    path_marks_.markers.push_back(planPathMarker(group, selected.transfer, transfer_ns,
+        0, 0.05f, 0.82f, 0.28f, 1.0f, 0.005));
+    path_marks_.markers.push_back(planPathMarker(group, selected.descent, stroke_ns,
+        0, 1.0f, 0.38f, 0.04f, 1.0f, 0.005));
+
+    visualization_msgs::msg::MarkerArray output = marks_;
+    output.markers.insert(output.markers.end(), deletions.markers.begin(), deletions.markers.end());
+    output.markers.insert(output.markers.end(), path_marks_.markers.begin(), path_marks_.markers.end());
+    marker_pub_->publish(output);
+  }
+
   void markPad(int component, std::size_t pad, const Eigen::Vector3d& at)
   {
     visualization_msgs::msg::Marker m;
@@ -1425,11 +1506,11 @@ private:
     m.type = visualization_msgs::msg::Marker::SPHERE; m.action = visualization_msgs::msg::Marker::ADD;
     m.pose.orientation.w = 1.0;
     m.pose.position.x = at.x(); m.pose.position.y = at.y(); m.pose.position.z = at.z();
-    m.scale.x = 0.004; m.scale.y = 0.004; m.scale.z = 0.002;
+    m.scale.x = 0.004; m.scale.y = 0.004; m.scale.z = 0.001;
     m.color.r = 0.1f; m.color.g = 1.0f; m.color.b = 0.2f; m.color.a = 1.0f;
     // Publish the full set so late RViz subscribers see every completed pad.
     marks_.markers.push_back(m);
-    marker_pub_->publish(marks_);
+    publishAllMarkers();
   }
 
   void markSeam(int component, const std::vector<Eigen::Vector3d>& points)
@@ -1455,7 +1536,7 @@ private:
       m.points.push_back(marker_point);
     }
     marks_.markers.push_back(std::move(m));
-    marker_pub_->publish(marks_);
+    publishAllMarkers();
   }
 
   void status(const std::string& text)
@@ -1474,10 +1555,11 @@ private:
   std::map<std::string, std::string> available_pipeline_plugins_;
   std::set<std::string> warned_unavailable_planners_;
   bool planner_catalog_available_ = false;
-  double planner_timeout_seconds_ = 1.5;
+  double planner_timeout_seconds_ = 2.0;
   double dwell_ = 1.5, clearance_ = 0.06;
   std::set<int> completed_;
   visualization_msgs::msg::MarkerArray marks_;
+  visualization_msgs::msg::MarkerArray path_marks_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr status_pub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr marker_pub_;
 };
